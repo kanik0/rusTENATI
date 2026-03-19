@@ -1,0 +1,38 @@
+# Rustenati Configuration
+# Copy to ~/.config/rustenati/config.toml
+
+[download]
+output_dir = "./antenati"
+concurrency = 4
+delay_ms = 500
+quality = "full"
+format = "jpg"
+resume = true
+
+[http]
+# user_agent = "Mozilla/5.0 (compatible; Rustenati/0.1.0)"
+timeout_secs = 30
+max_retries = 5
+
+[ocr]
+default_backend = "claude"
+language = "it"
+concurrency = 2
+
+[ocr.claude]
+api_key = ""  # or set ANTHROPIC_API_KEY env var
+model = "claude-sonnet-4-20250514"
+
+[ocr.transkribus]
+api_key = ""
+model_id = "italian_m1"
+
+[ocr.azure]
+endpoint = ""
+api_key = ""
+
+[ocr.google]
+credentials_path = ""
+
+[logging]
+level = "info"
