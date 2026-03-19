@@ -1,0 +1,85 @@
+{
+    "@context": "http://iiif.io/api/presentation/2/context.json",
+    "@id": "https://dam-antenati.cultura.gov.it/antenati/containers/e3b0c442/manifest",
+    "@type": "sc:Manifest",
+    "label": "Stato civile napoleonico - Nati - 1807",
+    "metadata": [
+        {"label": "Contesto archivistico", "value": "Stato civile napoleonico > Camposano (provincia di Napoli)"},
+        {"label": "Titolo", "value": "Nati - 1807"},
+        {"label": "Tipologia", "value": "Nati"},
+        {"label": "Segnatura attuale", "value": "82.1422"},
+        {"label": "Estremo remoto", "value": "1807"},
+        {"label": "Estremo recente", "value": "1807"}
+    ],
+    "sequences": [{
+        "@type": "sc:Sequence",
+        "canvases": [
+            {
+                "@id": "https://dam-antenati.cultura.gov.it/iiif/2/AN_ua18771_pag001",
+                "@type": "sc:Canvas",
+                "label": "pag. 1",
+                "width": 3204,
+                "height": 4613,
+                "images": [{
+                    "@type": "oa:Annotation",
+                    "motivation": "sc:painting",
+                    "resource": {
+                        "@id": "https://iiif-antenati.cultura.gov.it/iiif/2/AN_ua18771_pag001/full/full/0/default.jpg",
+                        "@type": "dctypes:Image",
+                        "format": "image/jpeg",
+                        "service": {
+                            "@id": "https://iiif-antenati.cultura.gov.it/iiif/2/AN_ua18771_pag001",
+                            "@context": "http://iiif.io/api/image/2/context.json",
+                            "profile": "http://iiif.io/api/image/2/level2.json"
+                        }
+                    },
+                    "on": "https://dam-antenati.cultura.gov.it/iiif/2/AN_ua18771_pag001"
+                }]
+            },
+            {
+                "@id": "https://dam-antenati.cultura.gov.it/iiif/2/AN_ua18771_pag002",
+                "@type": "sc:Canvas",
+                "label": "pag. 2",
+                "width": 3204,
+                "height": 4613,
+                "images": [{
+                    "@type": "oa:Annotation",
+                    "motivation": "sc:painting",
+                    "resource": {
+                        "@id": "https://iiif-antenati.cultura.gov.it/iiif/2/AN_ua18771_pag002/full/full/0/default.jpg",
+                        "@type": "dctypes:Image",
+                        "format": "image/jpeg",
+                        "service": {
+                            "@id": "https://iiif-antenati.cultura.gov.it/iiif/2/AN_ua18771_pag002",
+                            "@context": "http://iiif.io/api/image/2/context.json",
+                            "profile": "http://iiif.io/api/image/2/level2.json"
+                        }
+                    },
+                    "on": "https://dam-antenati.cultura.gov.it/iiif/2/AN_ua18771_pag002"
+                }]
+            },
+            {
+                "@id": "https://dam-antenati.cultura.gov.it/iiif/2/AN_ua18771_pag003",
+                "@type": "sc:Canvas",
+                "label": "pag. 3",
+                "width": 3204,
+                "height": 4613,
+                "images": [{
+                    "@type": "oa:Annotation",
+                    "motivation": "sc:painting",
+                    "resource": {
+                        "@id": "https://iiif-antenati.cultura.gov.it/iiif/2/AN_ua18771_pag003/full/full/0/default.jpg",
+                        "@type": "dctypes:Image",
+                        "format": "image/jpeg",
+                        "service": {
+                            "@id": "https://iiif-antenati.cultura.gov.it/iiif/2/AN_ua18771_pag003",
+                            "@context": "http://iiif.io/api/image/2/context.json",
+                            "profile": "http://iiif.io/api/image/2/level2.json"
+                        }
+                    },
+                    "on": "https://dam-antenati.cultura.gov.it/iiif/2/AN_ua18771_pag003"
+                }]
+            }
+        ]
+    }]
+}

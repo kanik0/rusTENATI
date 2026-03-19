@@ -1,0 +1,69 @@
+{
+    "@context": "http://iiif.io/api/presentation/3/context.json",
+    "id": "https://dam-antenati.cultura.gov.it/antenati/containers/f2ca1bb6/manifest",
+    "type": "Manifest",
+    "label": {"it": ["Nati - 1820"]},
+    "metadata": [
+        {"label": {"it": ["Contesto archivistico"]}, "value": {"it": ["Stato civile della restaurazione > Viareggio (provincia di Lucca)"]}},
+        {"label": {"it": ["Titolo"]}, "value": {"it": ["Nati - 1820"]}},
+        {"label": {"it": ["Tipologia"]}, "value": {"it": ["Nati"]}},
+        {"label": {"it": ["Segnatura attuale"]}, "value": {"it": ["45.789"]}},
+        {"label": {"it": ["Estremo remoto"]}, "value": {"it": ["1820"]}}
+    ],
+    "items": [
+        {
+            "id": "https://dam-antenati.cultura.gov.it/canvas/p1",
+            "type": "Canvas",
+            "label": {"it": ["pag. 1"]},
+            "width": 2480,
+            "height": 3508,
+            "items": [{
+                "id": "https://dam-antenati.cultura.gov.it/page/p1/1",
+                "type": "AnnotationPage",
+                "items": [{
+                    "id": "https://dam-antenati.cultura.gov.it/annotation/p1-image",
+                    "type": "Annotation",
+                    "motivation": "painting",
+                    "body": {
+                        "id": "https://iiif-antenati.cultura.gov.it/iiif/3/AN_ua22345_pag001/full/max/0/default.jpg",
+                        "type": "Image",
+                        "format": "image/jpeg",
+                        "service": [{
+                            "id": "https://iiif-antenati.cultura.gov.it/iiif/3/AN_ua22345_pag001",
+                            "type": "ImageService3",
+                            "profile": "level1"
+                        }]
+                    },
+                    "target": "https://dam-antenati.cultura.gov.it/canvas/p1"
+                }]
+            }]
+        },
+        {
+            "id": "https://dam-antenati.cultura.gov.it/canvas/p2",
+            "type": "Canvas",
+            "label": {"it": ["pag. 2"]},
+            "width": 2480,
+            "height": 3508,
+            "items": [{
+                "id": "https://dam-antenati.cultura.gov.it/page/p2/1",
+                "type": "AnnotationPage",
+                "items": [{
+                    "id": "https://dam-antenati.cultura.gov.it/annotation/p2-image",
+                    "type": "Annotation",
+                    "motivation": "painting",
+                    "body": {
+                        "id": "https://iiif-antenati.cultura.gov.it/iiif/3/AN_ua22345_pag002/full/max/0/default.jpg",
+                        "type": "Image",
+                        "format": "image/jpeg",
+                        "service": [{
+                            "id": "https://iiif-antenati.cultura.gov.it/iiif/3/AN_ua22345_pag002",
+                            "type": "ImageService3",
+                            "profile": "level1"
+                        }]
+                    },
+                    "target": "https://dam-antenati.cultura.gov.it/canvas/p2"
+                }]
+            }]
+        }
+    ]
+}
