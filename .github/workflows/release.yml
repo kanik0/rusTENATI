@@ -1,0 +1,51 @@
+name: Release
+
+on:
+  workflow_run:
+    workflows: ["Test"]
+    types: [completed]
+    branches: [main]
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Get package version
+        id: version
+        run: |
+          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+          echo "cargo_version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Compute next release number
+        id: release_number
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CARGO_VERSION: ${{ steps.version.outputs.cargo_version }}
+        run: |
+          LAST_N=$(gh release list --json tagName --jq "[.[] | .tagName | select(startswith(\"v${CARGO_VERSION}.\")) | ltrimstr(\"v${CARGO_VERSION}.\") | tonumber] | max // 0")
+          NEXT_N=$((LAST_N + 1))
+          TAG="v${CARGO_VERSION}.${NEXT_N}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Next release: $TAG"
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release_number.outputs.tag }}
+        run: |
+          gh release create "$TAG" \
+            target/release/rustenati \
+            --title "$TAG" \
+            --generate-notes
