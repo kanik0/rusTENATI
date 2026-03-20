@@ -77,6 +77,10 @@ pub struct DownloadArgs {
     #[arg(long, default_value = "100")]
     pub max_registries: usize,
 
+    /// Fetch all registries (ignores --max-registries limit)
+    #[arg(long)]
+    pub all: bool,
+
     // --- Noah mode: dump EVERYTHING ---
     /// Noah mode: dump ALL archives, ALL registries, ALL images from the entire portal
     #[arg(long)]
@@ -232,13 +236,18 @@ async fn run_batch_download(
         let total_pages = results.total_pages;
         all_results.extend(results.results);
 
-        if page >= total_pages || all_results.len() >= args.max_registries {
+        if page >= total_pages {
+            break;
+        }
+        if !args.all && all_results.len() >= args.max_registries {
             break;
         }
         page += 1;
     }
 
-    all_results.truncate(args.max_registries);
+    if !args.all {
+        all_results.truncate(args.max_registries);
+    }
     let total_registries = all_results.len();
     eprintln!("Found {total_registries} registries to download.");
 
@@ -472,8 +481,12 @@ async fn run_noah_mode(
                     }
                     all_results.extend(results.results);
 
-                    if page >= total_pages
-                        || (args.max_registries > 0 && all_results.len() >= args.max_registries)
+                    if page >= total_pages {
+                        break;
+                    }
+                    if !args.all
+                        && args.max_registries > 0
+                        && all_results.len() >= args.max_registries
                     {
                         break;
                     }
@@ -487,7 +500,7 @@ async fn run_noah_mode(
             }
         }
 
-        if args.max_registries > 0 {
+        if !args.all && args.max_registries > 0 {
             all_results.truncate(args.max_registries);
         }
 

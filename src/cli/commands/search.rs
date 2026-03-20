@@ -330,13 +330,18 @@ async fn run_registry_search_all(
         total_pages = results.total_pages;
         all_results.extend(results.results);
 
-        if page >= total_pages || all_results.len() >= args.limit {
+        if page >= total_pages {
+            break;
+        }
+        if !args.all && all_results.len() >= args.limit {
             break;
         }
         page += 1;
     }
 
-    all_results.truncate(args.limit);
+    if !args.all {
+        all_results.truncate(args.limit);
+    }
 
     let combined = SearchResults {
         total,
