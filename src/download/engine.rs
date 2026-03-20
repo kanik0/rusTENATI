@@ -110,18 +110,15 @@ pub async fn download_manifest(
     output::write_manifest_json(output_dir, manifest)?;
     output::write_metadata_json(output_dir, manifest, &chrono::Utc::now().to_rfc3339())?;
 
-    // Register manifest and downloads in state DB
-    state_db.upsert_manifest(
-        &manifest.id,
-        manifest.archival_context().unwrap_or("unknown"),
-        Some(manifest.title()),
-        manifest.canvases.len(),
-        None,
-    )?;
+    // Register manifest with full metadata and downloads in state DB
+    state_db.store_manifest_from_iiif(manifest, None)?;
 
     for (i, canvas) in &canvases {
         let url = canvas.full_image_url(&config.image_format);
-        state_db.insert_download(&manifest.id, &canvas.id, *i, &url)?;
+        state_db.insert_download_full(
+            &manifest.id, &canvas.id, *i, &url,
+            Some(&canvas.label), Some(canvas.width), Some(canvas.height),
+        )?;
     }
 
     // Resume: filter out already completed downloads

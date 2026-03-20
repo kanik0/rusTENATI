@@ -5,6 +5,7 @@ use clap::Args;
 use comfy_table::{presets::UTF8_FULL_CONDENSED, Table};
 
 use crate::client::antenati::AntenatiClient;
+use crate::download::state::StateDb;
 use crate::models::search::{NameSearchResults, RegistrySearchParams, SearchResults};
 
 #[derive(Debug, Args)]
@@ -71,12 +72,17 @@ pub struct RegistrySearchArgs {
     /// Max results (when using --all)
     #[arg(long, default_value = "1000")]
     pub limit: usize,
+
+    /// Search local database only (offline mode)
+    #[arg(long)]
+    pub offline: bool,
 }
 
 pub async fn run_name_search(
     args: &NameSearchArgs,
     json_output: bool,
     client: Arc<AntenatiClient>,
+    state_db: Option<&StateDb>,
 ) -> Result<()> {
     let results = client
         .search_names(
@@ -89,6 +95,29 @@ pub async fn run_name_search(
             args.limit.min(100) as u32,
         )
         .await?;
+
+    // Cache results in local database
+    if let Some(db) = state_db {
+        let params_json = serde_json::json!({
+            "surname": args.surname,
+            "name": args.name,
+            "locality": args.locality,
+            "year_from": args.year_from,
+            "year_to": args.year_to,
+        }).to_string();
+
+        let query_id = db.insert_search_query(
+            "nominative",
+            &params_json,
+            Some(results.total),
+            Some(1),
+        )?;
+
+        for (i, result) in results.results.iter().enumerate() {
+            let person_id = db.upsert_person(result)?;
+            db.insert_person_search_result(query_id, person_id, i as i32)?;
+        }
+    }
 
     display_name_results(&results, json_output)
 }
@@ -151,13 +180,19 @@ pub async fn run_registry_search(
     args: &RegistrySearchArgs,
     json_output: bool,
     client: Arc<AntenatiClient>,
+    state_db: Option<&StateDb>,
 ) -> Result<()> {
+    // Offline mode: search local database only
+    if args.offline {
+        return run_registry_search_offline(args, json_output, state_db);
+    }
+
     if args.locality.is_none() && args.archive.is_none() {
         anyhow::bail!("At least one of --locality or --archive is required");
     }
 
     if args.all {
-        return run_registry_search_all(args, json_output, client).await;
+        return run_registry_search_all(args, json_output, client, state_db).await;
     }
 
     let archive_name = resolve_archive_name(args.archive.as_deref());
@@ -174,13 +209,99 @@ pub async fn run_registry_search(
     };
 
     let results = client.search_registries_params(&params).await?;
+
+    // Cache results in local database
+    cache_registry_results(state_db, args, &results)?;
+
     display_results(&results, json_output)
+}
+
+fn run_registry_search_offline(
+    args: &RegistrySearchArgs,
+    json_output: bool,
+    state_db: Option<&StateDb>,
+) -> Result<()> {
+    let db = state_db.ok_or_else(|| anyhow::anyhow!("No database available for offline search"))?;
+
+    let results = db.search_registry_results(
+        args.doc_type.as_deref(),
+        args.year_from.map(|y| y.to_string()).as_deref(),
+        args.archive.as_deref(),
+        args.locality.as_deref(),
+    )?;
+
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&results)?);
+        return Ok(());
+    }
+
+    eprintln!("{} cached results found.", results.len());
+
+    if results.is_empty() {
+        println!("No cached results found. Run a search without --offline first.");
+        return Ok(());
+    }
+
+    let mut table = Table::new();
+    table.load_preset(UTF8_FULL_CONDENSED);
+    table.set_header(vec!["#", "Year", "Type", "Location", "Archive", "ARK", "Downloaded"]);
+
+    for (i, r) in results.iter().enumerate() {
+        let locality = r.context.as_deref()
+            .and_then(|c| c.rsplit(" > ").next())
+            .unwrap_or("-");
+        let ark_short = r.ark_url.rsplit('/').next().unwrap_or(&r.ark_url);
+        let downloaded = if r.manifest_id.is_some() { "yes" } else { "-" };
+
+        table.add_row(vec![
+            &format!("{}", i + 1),
+            r.year.as_deref().unwrap_or("-"),
+            r.doc_type.as_deref().unwrap_or("-"),
+            locality,
+            r.archive_name.as_deref().unwrap_or("-"),
+            ark_short,
+            downloaded,
+        ]);
+    }
+
+    println!("{table}");
+    Ok(())
+}
+
+fn cache_registry_results(
+    state_db: Option<&StateDb>,
+    args: &RegistrySearchArgs,
+    results: &SearchResults,
+) -> Result<()> {
+    let Some(db) = state_db else { return Ok(()) };
+
+    let params_json = serde_json::json!({
+        "locality": args.locality,
+        "archive": args.archive,
+        "year_from": args.year_from,
+        "year_to": args.year_to,
+        "doc_type": args.doc_type,
+    }).to_string();
+
+    let query_id = db.insert_search_query(
+        "registry",
+        &params_json,
+        Some(results.total),
+        Some(results.current_page),
+    )?;
+
+    for result in &results.results {
+        db.insert_registry_result(query_id, result)?;
+    }
+
+    Ok(())
 }
 
 async fn run_registry_search_all(
     args: &RegistrySearchArgs,
     json_output: bool,
     client: Arc<AntenatiClient>,
+    state_db: Option<&StateDb>,
 ) -> Result<()> {
     let mut all_results = Vec::new();
     let mut page = 1u32;
@@ -224,6 +345,9 @@ async fn run_registry_search_all(
         page_size: all_results.len() as u32,
         results: all_results,
     };
+
+    // Cache all results
+    cache_registry_results(state_db, args, &combined)?;
 
     display_results(&combined, json_output)
 }

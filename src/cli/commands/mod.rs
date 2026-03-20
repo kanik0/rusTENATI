@@ -3,6 +3,7 @@ pub mod config;
 pub mod download;
 pub mod info;
 pub mod ocr;
+pub mod query;
 pub mod search;
 pub mod status;
 pub mod tags;

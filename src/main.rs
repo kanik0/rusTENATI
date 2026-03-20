@@ -9,12 +9,15 @@ pub use rustenati::models;
 pub use rustenati::ocr;
 pub use rustenati::output;
 
+use std::path::PathBuf;
+
 use anyhow::Result;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
 use crate::cli::{Cli, Command, SearchMode};
 use crate::client::antenati::AntenatiClient;
+use crate::download::state::StateDb;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -49,16 +52,21 @@ async fn main() -> Result<()> {
     // Create HTTP client (shared across commands)
     let client = AntenatiClient::new(&config.http)?;
 
+    // Open shared state database for commands that need it
+    let state_db = open_default_state_db();
+
     // Dispatch commands
     match &cli.command {
         Command::Search { mode } => match mode {
             SearchMode::Name(args) => {
-                cli::commands::search::run_name_search(args, cli.json, client.clone())
-                    .await?;
+                cli::commands::search::run_name_search(
+                    args, cli.json, client.clone(), state_db.as_ref().ok(),
+                ).await?;
             }
             SearchMode::Registry(args) => {
-                cli::commands::search::run_registry_search(args, cli.json, client.clone())
-                    .await?;
+                cli::commands::search::run_registry_search(
+                    args, cli.json, client.clone(), state_db.as_ref().ok(),
+                ).await?;
             }
         },
         Command::Browse { action } => {
@@ -68,7 +76,7 @@ async fn main() -> Result<()> {
             cli::commands::download::run(args, cli.json, client.clone()).await?;
         }
         Command::Info(args) => {
-            cli::commands::info::run(args, cli.json, client).await?;
+            cli::commands::info::run(args, cli.json, client, state_db.as_ref().ok()).await?;
         }
         Command::Ocr(args) => {
             cli::commands::ocr::run(args, cli.json, &config.ocr).await?;
@@ -82,7 +90,17 @@ async fn main() -> Result<()> {
         Command::Config { action } => {
             cli::commands::config::run(action, &config)?;
         }
+        Command::Query { action } => {
+            cli::commands::query::run(action, cli.json)?;
+        }
     }
 
     Ok(())
+}
+
+/// Open the default state database at ./antenati/rustenati.db.
+/// Returns Ok if the database opens (or is created), Err if it fails.
+fn open_default_state_db() -> Result<StateDb> {
+    let db_path = PathBuf::from("./antenati/rustenati.db");
+    StateDb::open(&db_path)
 }
