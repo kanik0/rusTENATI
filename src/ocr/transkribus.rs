@@ -5,18 +5,18 @@ use async_trait::async_trait;
 use base64::Engine;
 use reqwest::Client;
 use serde::Deserialize;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::config::TranskribusOcrConfig;
 
 use super::{DocumentType, OcrBackend, OcrResult};
 
-const TRANSKRIBUS_API_URL: &str = "https://transkribus.eu/TrpServer/rest";
+const METAGRAPHO_API_URL: &str = "https://transkribus.eu/processing/v1";
 
 pub struct TranskribusBackend {
     client: Client,
     access_token: String,
-    model_id: String,
+    htr_id: i64,
 }
 
 impl TranskribusBackend {
@@ -28,16 +28,22 @@ impl TranskribusBackend {
             config.access_token.clone()
         };
 
-        let model_id = if config.model_id.is_empty() {
-            "italian_m1".to_string()
+        let htr_id = if config.htr_id != 0 {
+            config.htr_id
+        } else if !config.model_id.is_empty() {
+            config.model_id.parse::<i64>()
+                .context("model_id must be a numeric HTR model ID (see Transkribus model list)")?
         } else {
-            config.model_id.clone()
+            anyhow::bail!(
+                "Transkribus requires htr_id (numeric model ID). \
+                 Find your model ID at https://www.transkribus.org/models"
+            )
         };
 
         Ok(Self {
             client: Client::new(),
             access_token,
-            model_id,
+            htr_id,
         })
     }
 }
@@ -62,43 +68,57 @@ impl OcrBackend for TranskribusBackend {
         let base64_image = base64::engine::general_purpose::STANDARD.encode(&image_data);
 
         debug!(
-            "Transkribus OCR: model={}, image={}, size={}KB",
-            self.model_id,
+            "Transkribus OCR: htr_id={}, image={}, size={}KB",
+            self.htr_id,
             image_path.display(),
             image_data.len() / 1024
         );
 
-        // Step 1: Upload image and start recognition
-        let upload_response = self
+        // Step 1: Submit image for recognition via metagrapho API
+        let submit_response = self
             .client
-            .post(format!("{TRANSKRIBUS_API_URL}/recognition/upload"))
+            .post(format!("{METAGRAPHO_API_URL}/processes"))
             .header("Authorization", format!("Bearer {}", self.access_token))
             .json(&serde_json::json!({
-                "image": base64_image,
-                "modelId": self.model_id,
+                "config": {
+                    "textRecognition": {
+                        "htrId": self.htr_id
+                    }
+                },
+                "image": {
+                    "base64": base64_image
+                }
             }))
             .send()
             .await
-            .context("Failed to upload image to Transkribus")?;
+            .context("Failed to submit image to Transkribus")?;
 
-        if !upload_response.status().is_success() {
-            let error_body = upload_response.text().await.unwrap_or_default();
-            anyhow::bail!("Transkribus upload error: {error_body}");
+        if !submit_response.status().is_success() {
+            let status = submit_response.status();
+            let error_body = submit_response.text().await.unwrap_or_default();
+            if status.as_u16() == 401 {
+                anyhow::bail!(
+                    "Transkribus authentication failed (401). \
+                     Your access token may be expired — obtain a new one from \
+                     https://account.readcoop.eu/auth/realms/readcoop/protocol/openid-connect/token"
+                );
+            }
+            anyhow::bail!("Transkribus submit error ({status}): {error_body}");
         }
 
-        let job: JobResponse = upload_response
+        let process: ProcessResponse = submit_response
             .json()
             .await
-            .context("Failed to parse Transkribus upload response")?;
+            .context("Failed to parse Transkribus submit response")?;
 
-        info!("Transkribus job started: {}", job.job_id);
+        info!("Transkribus process started: {}", process.process_id);
 
         // Step 2: Poll for completion
-        let text = self.poll_result(&job.job_id).await?;
+        let text = self.poll_result(process.process_id).await?;
 
         Ok(OcrResult {
             text,
-            tags: Vec::new(), // Transkribus doesn't extract structured tags natively
+            tags: Vec::new(),
             confidence: None,
             backend: "transkribus".to_string(),
         })
@@ -106,47 +126,162 @@ impl OcrBackend for TranskribusBackend {
 }
 
 impl TranskribusBackend {
-    async fn poll_result(&self, job_id: &str) -> Result<String> {
+    async fn poll_result(&self, process_id: i64) -> Result<String> {
         let max_polls = 60; // 5 minutes at 5s intervals
         for i in 0..max_polls {
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
             let response = self
                 .client
-                .get(format!("{TRANSKRIBUS_API_URL}/recognition/{job_id}/result"))
+                .get(format!("{METAGRAPHO_API_URL}/processes/{process_id}"))
                 .header("Authorization", format!("Bearer {}", self.access_token))
                 .send()
                 .await?;
 
-            if response.status().as_u16() == 200 {
-                let result: ResultResponse = response.json().await?;
-                if result.status == "FINISHED" {
-                    return Ok(result.text.unwrap_or_default());
-                }
-                if result.status == "FAILED" {
-                    anyhow::bail!(
-                        "Transkribus recognition failed: {}",
-                        result.error.unwrap_or_default()
-                    );
-                }
+            if !response.status().is_success() {
+                warn!("Transkribus poll returned status {}", response.status());
+                continue;
             }
 
-            debug!("Transkribus poll {}/{max_polls}: waiting...", i + 1);
+            let result: ProcessStatusResponse = response
+                .json()
+                .await
+                .context("Failed to parse Transkribus status response")?;
+
+            match result.status.as_str() {
+                "FINISHED" => {
+                    // Extract text from the process result
+                    return self.fetch_text_result(process_id).await;
+                }
+                "FAILED" => {
+                    anyhow::bail!(
+                        "Transkribus recognition failed: {}",
+                        result.description.unwrap_or_default()
+                    );
+                }
+                status => {
+                    debug!("Transkribus poll {}/{max_polls}: status={status}", i + 1);
+                }
+            }
         }
 
         anyhow::bail!("Transkribus recognition timed out after 5 minutes")
     }
+
+    async fn fetch_text_result(&self, process_id: i64) -> Result<String> {
+        // Fetch ALTO XML and extract text, or fall back to PAGE XML
+        let response = self
+            .client
+            .get(format!("{METAGRAPHO_API_URL}/processes/{process_id}/alto"))
+            .header("Authorization", format!("Bearer {}", self.access_token))
+            .send()
+            .await
+            .context("Failed to fetch Transkribus ALTO result")?;
+
+        if response.status().is_success() {
+            let alto_xml = response.text().await?;
+            return Ok(extract_text_from_alto(&alto_xml));
+        }
+
+        // Fallback: try PAGE XML
+        let response = self
+            .client
+            .get(format!("{METAGRAPHO_API_URL}/processes/{process_id}/page"))
+            .header("Authorization", format!("Bearer {}", self.access_token))
+            .send()
+            .await
+            .context("Failed to fetch Transkribus PAGE result")?;
+
+        if response.status().is_success() {
+            let page_xml = response.text().await?;
+            return Ok(extract_text_from_page(&page_xml));
+        }
+
+        anyhow::bail!("Failed to retrieve text from Transkribus process {process_id}")
+    }
+}
+
+/// Extract plain text from ALTO XML by finding all <String CONTENT="..."> elements.
+fn extract_text_from_alto(xml: &str) -> String {
+    let mut lines = Vec::new();
+    let mut current_line = Vec::new();
+
+    for segment in xml.split('<') {
+        let segment = segment.trim();
+        if segment.starts_with("String ") || segment.starts_with("String\t") {
+            if let Some(content) = extract_xml_attr(segment, "CONTENT") {
+                current_line.push(content);
+            }
+        } else if segment.starts_with("TextLine") && !segment.contains('/') {
+            if !current_line.is_empty() {
+                lines.push(current_line.join(" "));
+                current_line.clear();
+            }
+        } else if segment.starts_with("/TextBlock") || segment.starts_with("/PrintSpace") {
+            if !current_line.is_empty() {
+                lines.push(current_line.join(" "));
+                current_line.clear();
+            }
+        }
+    }
+    if !current_line.is_empty() {
+        lines.push(current_line.join(" "));
+    }
+
+    lines.join("\n")
+}
+
+/// Extract plain text from PAGE XML by finding all <Unicode> elements.
+fn extract_text_from_page(xml: &str) -> String {
+    let mut lines = Vec::new();
+    let mut in_unicode = false;
+    let mut current_text = String::new();
+
+    for segment in xml.split('<') {
+        if in_unicode {
+            if let Some(text) = segment.split('>').next() {
+                if text.starts_with("/Unicode") {
+                    lines.push(current_text.clone());
+                    current_text.clear();
+                    in_unicode = false;
+                }
+            }
+        }
+        if segment.starts_with("Unicode") {
+            in_unicode = true;
+            if let Some(rest) = segment.split('>').nth(1) {
+                current_text.push_str(rest);
+            }
+        }
+    }
+
+    lines.join("\n")
+}
+
+fn extract_xml_attr<'a>(tag: &'a str, attr: &str) -> Option<String> {
+    let pattern = format!("{attr}=\"");
+    let start = tag.find(&pattern)? + pattern.len();
+    let rest = &tag[start..];
+    let end = rest.find('"')?;
+    Some(html_unescape(&rest[..end]))
+}
+
+fn html_unescape(s: &str) -> String {
+    s.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
 }
 
 #[derive(Deserialize)]
-struct JobResponse {
-    #[serde(alias = "jobId")]
-    job_id: String,
+struct ProcessResponse {
+    #[serde(alias = "processId")]
+    process_id: i64,
 }
 
 #[derive(Deserialize)]
-struct ResultResponse {
+struct ProcessStatusResponse {
     status: String,
-    text: Option<String>,
-    error: Option<String>,
+    description: Option<String>,
 }
