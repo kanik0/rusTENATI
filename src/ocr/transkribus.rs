@@ -15,17 +15,17 @@ const TRANSKRIBUS_API_URL: &str = "https://transkribus.eu/TrpServer/rest";
 
 pub struct TranskribusBackend {
     client: Client,
-    api_key: String,
+    access_token: String,
     model_id: String,
 }
 
 impl TranskribusBackend {
     pub fn new(config: &TranskribusOcrConfig) -> Result<Self> {
-        let api_key = if config.api_key.is_empty() {
-            std::env::var("TRANSKRIBUS_API_KEY")
-                .context("TRANSKRIBUS_API_KEY not set and no api_key in config")?
+        let access_token = if config.access_token.is_empty() {
+            std::env::var("TRANSKRIBUS_ACCESS_TOKEN")
+                .context("TRANSKRIBUS_ACCESS_TOKEN not set and no access_token in config")?
         } else {
-            config.api_key.clone()
+            config.access_token.clone()
         };
 
         let model_id = if config.model_id.is_empty() {
@@ -36,7 +36,7 @@ impl TranskribusBackend {
 
         Ok(Self {
             client: Client::new(),
-            api_key,
+            access_token,
             model_id,
         })
     }
@@ -72,7 +72,7 @@ impl OcrBackend for TranskribusBackend {
         let upload_response = self
             .client
             .post(format!("{TRANSKRIBUS_API_URL}/recognition/upload"))
-            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Authorization", format!("Bearer {}", self.access_token))
             .json(&serde_json::json!({
                 "image": base64_image,
                 "modelId": self.model_id,
@@ -114,7 +114,7 @@ impl TranskribusBackend {
             let response = self
                 .client
                 .get(format!("{TRANSKRIBUS_API_URL}/recognition/{job_id}/result"))
-                .header("Authorization", format!("Bearer {}", self.api_key))
+                .header("Authorization", format!("Bearer {}", self.access_token))
                 .send()
                 .await?;
 

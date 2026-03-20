@@ -59,7 +59,8 @@ pub struct ClaudeOcrConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct TranskribusOcrConfig {
-    pub api_key: String,
+    #[serde(alias = "api_key")]
+    pub access_token: String,
     pub model_id: String,
 }
 
@@ -130,7 +131,7 @@ impl Default for OcrConfig {
                 model: "claude-sonnet-4-6".into(),
             },
             transkribus: TranskribusOcrConfig {
-                api_key: String::new(),
+                access_token: String::new(),
                 model_id: "italian_m1".into(),
             },
             azure: AzureOcrConfig::default(),
