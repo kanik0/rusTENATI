@@ -1,8 +1,33 @@
+# Rust build artifacts
 /target
 Cargo.lock
-*.swp
-*.swo
-.env
+
+# User config (config.example.toml is tracked as template)
+config.toml
+
+# Output directory (downloaded images/data)
+output/
+
+# SQLite databases
 *.db
 *.db-shm
 *.db-wal
+
+# Environment
+.env
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.code-workspace
+
+# Editor swap files
+*.swp
+*.swo
+
+# Logs
+*.log
