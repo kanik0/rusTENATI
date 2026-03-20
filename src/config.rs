@@ -61,6 +61,10 @@ pub struct ClaudeOcrConfig {
 pub struct TranskribusOcrConfig {
     #[serde(alias = "api_key")]
     pub access_token: String,
+    /// Numeric HTR model ID for the metagrapho API
+    pub htr_id: i64,
+    /// Legacy model_id string (parsed as integer fallback for htr_id)
+    #[serde(default)]
     pub model_id: String,
 }
 
@@ -132,7 +136,8 @@ impl Default for OcrConfig {
             },
             transkribus: TranskribusOcrConfig {
                 access_token: String::new(),
-                model_id: "italian_m1".into(),
+                htr_id: 0,
+                model_id: String::new(),
             },
             azure: AzureOcrConfig::default(),
             google: GoogleOcrConfig::default(),
