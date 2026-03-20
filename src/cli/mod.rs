@@ -75,6 +75,12 @@ pub enum Command {
         #[command(subcommand)]
         action: commands::config::ConfigAction,
     },
+
+    /// Query the local database (offline)
+    Query {
+        #[command(subcommand)]
+        action: commands::query::QueryAction,
+    },
 }
 
 #[derive(Debug, Subcommand)]

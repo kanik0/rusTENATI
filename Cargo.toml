@@ -39,7 +39,7 @@ governor = "0.8"
 backoff = { version = "0.4", features = ["tokio"] }
 
 # State persistence
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["bundled-full"] }
 
 # URL handling
 url = "2"

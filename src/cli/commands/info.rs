@@ -5,6 +5,7 @@ use clap::Args;
 use comfy_table::{Cell, Table};
 
 use crate::client::antenati::AntenatiClient;
+use crate::download::state::StateDb;
 use crate::models::manifest::IiifManifest;
 
 #[derive(Debug, Args)]
@@ -17,9 +18,21 @@ pub struct InfoArgs {
     pub full: bool,
 }
 
-pub async fn run(args: &InfoArgs, json_output: bool, client: Arc<AntenatiClient>) -> Result<()> {
+pub async fn run(
+    args: &InfoArgs,
+    json_output: bool,
+    client: Arc<AntenatiClient>,
+    state_db: Option<&StateDb>,
+) -> Result<()> {
     let manifest_url = client.resolve_manifest_url(&args.source).await?;
     let manifest = client.get_manifest(&manifest_url).await?;
+
+    // Persist manifest metadata to local database
+    if let Some(db) = state_db {
+        if let Err(e) = db.store_manifest_from_iiif(&manifest, Some(&args.source)) {
+            tracing::warn!("Failed to cache manifest metadata: {e}");
+        }
+    }
 
     if json_output {
         println!("{}", serde_json::to_string_pretty(&manifest)?);

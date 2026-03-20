@@ -3,7 +3,11 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 
-/// SQLite-backed state database for tracking downloads, manifests, sessions, and tags.
+use crate::models::manifest::{IiifManifest, MetadataEntry};
+use crate::models::search::{NameResult, RegistryResult};
+
+/// SQLite-backed state database for tracking downloads, manifests, sessions, tags,
+/// search results, persons, and archives.
 pub struct StateDb {
     conn: Connection,
 }
@@ -21,6 +25,7 @@ impl StateDb {
 
         let db = Self { conn };
         db.init_schema()?;
+        db.run_migrations()?;
         Ok(db)
     }
 
@@ -30,6 +35,7 @@ impl StateDb {
         let conn = Connection::open_in_memory()?;
         let db = Self { conn };
         db.init_schema()?;
+        db.run_migrations()?;
         Ok(db)
     }
 
@@ -97,13 +103,244 @@ impl StateDb {
             CREATE INDEX IF NOT EXISTS idx_tags_type_value ON tags(tag_type, value);
             CREATE INDEX IF NOT EXISTS idx_tags_download ON tags(download_id);
             CREATE INDEX IF NOT EXISTS idx_ocr_download ON ocr_results(download_id);
+
+            CREATE TABLE IF NOT EXISTS schema_version (
+                version INTEGER NOT NULL,
+                applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
             "
         ).context("Failed to initialize database schema")?;
 
         Ok(())
     }
 
-    /// Insert or update a manifest record.
+    // ─── Migration System ───────────────────────────────────────────────
+
+    fn get_schema_version(&self) -> Result<i32> {
+        let version: i32 = self.conn.query_row(
+            "SELECT COALESCE(MAX(version), 1) FROM schema_version",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(version)
+    }
+
+    fn run_migrations(&self) -> Result<()> {
+        let current = self.get_schema_version()?;
+
+        if current < 2 {
+            self.migrate_v2()?;
+        }
+
+        Ok(())
+    }
+
+    fn migrate_v2(&self) -> Result<()> {
+        self.conn.execute_batch("BEGIN TRANSACTION;")?;
+
+        let result = (|| -> Result<()> {
+            // --- New tables ---
+
+            self.conn.execute_batch(
+                "
+                CREATE TABLE IF NOT EXISTS archives (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    slug TEXT NOT NULL UNIQUE,
+                    url TEXT,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+                CREATE INDEX IF NOT EXISTS idx_archives_name ON archives(name);
+
+                CREATE TABLE IF NOT EXISTS localities (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    province TEXT,
+                    normalized_name TEXT NOT NULL,
+                    UNIQUE(name, province)
+                );
+                CREATE INDEX IF NOT EXISTS idx_localities_normalized ON localities(normalized_name);
+
+                CREATE TABLE IF NOT EXISTS search_queries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    query_type TEXT NOT NULL,
+                    params_json TEXT NOT NULL,
+                    total_results INTEGER,
+                    pages_fetched INTEGER,
+                    executed_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+
+                CREATE TABLE IF NOT EXISTS registry_results (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    query_id INTEGER NOT NULL REFERENCES search_queries(id),
+                    ark_url TEXT NOT NULL,
+                    year TEXT,
+                    doc_type TEXT,
+                    signature TEXT,
+                    context TEXT,
+                    archive_name TEXT,
+                    archive_url TEXT,
+                    manifest_id TEXT REFERENCES manifests(id),
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    UNIQUE(query_id, ark_url)
+                );
+                CREATE INDEX IF NOT EXISTS idx_registry_results_ark ON registry_results(ark_url);
+                CREATE INDEX IF NOT EXISTS idx_registry_results_year ON registry_results(year);
+                CREATE INDEX IF NOT EXISTS idx_registry_results_doc_type ON registry_results(doc_type);
+                CREATE INDEX IF NOT EXISTS idx_registry_results_query ON registry_results(query_id);
+
+                CREATE TABLE IF NOT EXISTS persons (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    surname TEXT,
+                    given_name TEXT,
+                    detail_url TEXT UNIQUE,
+                    birth_info TEXT,
+                    death_info TEXT,
+                    birth_place TEXT,
+                    birth_year INTEGER,
+                    death_place TEXT,
+                    death_year INTEGER,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+                CREATE INDEX IF NOT EXISTS idx_persons_surname ON persons(surname);
+                CREATE INDEX IF NOT EXISTS idx_persons_name ON persons(name);
+                CREATE INDEX IF NOT EXISTS idx_persons_birth_year ON persons(birth_year);
+
+                CREATE TABLE IF NOT EXISTS person_records (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    person_id INTEGER NOT NULL REFERENCES persons(id),
+                    record_type TEXT,
+                    date TEXT,
+                    ark_url TEXT,
+                    manifest_id TEXT REFERENCES manifests(id),
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    UNIQUE(person_id, ark_url)
+                );
+                CREATE INDEX IF NOT EXISTS idx_person_records_person ON person_records(person_id);
+                CREATE INDEX IF NOT EXISTS idx_person_records_ark ON person_records(ark_url);
+
+                CREATE TABLE IF NOT EXISTS person_search_results (
+                    query_id INTEGER NOT NULL REFERENCES search_queries(id),
+                    person_id INTEGER NOT NULL REFERENCES persons(id),
+                    result_index INTEGER NOT NULL,
+                    PRIMARY KEY (query_id, person_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS manifest_metadata (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    manifest_id TEXT NOT NULL REFERENCES manifests(id),
+                    label TEXT NOT NULL,
+                    value TEXT NOT NULL,
+                    UNIQUE(manifest_id, label)
+                );
+                CREATE INDEX IF NOT EXISTS idx_manifest_metadata_manifest ON manifest_metadata(manifest_id);
+                CREATE INDEX IF NOT EXISTS idx_manifest_metadata_label ON manifest_metadata(label);
+                "
+            )?;
+
+            // --- ALTER TABLE: add columns to manifests ---
+            let manifest_columns = [
+                ("ark_url", "TEXT"),
+                ("doc_type", "TEXT"),
+                ("archival_context", "TEXT"),
+                ("archive_db_id", "INTEGER REFERENCES archives(id)"),
+                ("locality_id", "INTEGER REFERENCES localities(id)"),
+                ("signature", "TEXT"),
+                ("date_from", "TEXT"),
+                ("date_to", "TEXT"),
+                ("license", "TEXT"),
+                ("language", "TEXT"),
+                ("iiif_version", "TEXT"),
+                ("year", "TEXT"),
+            ];
+
+            for (col, typ) in &manifest_columns {
+                // ALTER TABLE ADD COLUMN is idempotent-safe: if column exists, it errors,
+                // but we ignore that error.
+                let sql = format!("ALTER TABLE manifests ADD COLUMN {col} {typ}");
+                let _ = self.conn.execute_batch(&sql);
+            }
+
+            // --- ALTER TABLE: add columns to downloads ---
+            let download_columns = [
+                ("canvas_label", "TEXT"),
+                ("width", "INTEGER"),
+                ("height", "INTEGER"),
+            ];
+
+            for (col, typ) in &download_columns {
+                let sql = format!("ALTER TABLE downloads ADD COLUMN {col} {typ}");
+                let _ = self.conn.execute_batch(&sql);
+            }
+
+            // --- Indexes on new manifest columns ---
+            self.conn.execute_batch(
+                "
+                CREATE INDEX IF NOT EXISTS idx_manifests_doc_type ON manifests(doc_type);
+                CREATE INDEX IF NOT EXISTS idx_manifests_archive ON manifests(archive_db_id);
+                CREATE INDEX IF NOT EXISTS idx_manifests_locality ON manifests(locality_id);
+                CREATE INDEX IF NOT EXISTS idx_manifests_year ON manifests(year);
+                CREATE INDEX IF NOT EXISTS idx_manifests_ark ON manifests(ark_url);
+                "
+            )?;
+
+            // --- FTS5 for OCR full-text search ---
+            self.conn.execute_batch(
+                "
+                CREATE VIRTUAL TABLE IF NOT EXISTS ocr_fulltext USING fts5(
+                    text,
+                    content='ocr_results',
+                    content_rowid='id'
+                );
+
+                CREATE TRIGGER IF NOT EXISTS ocr_results_ai AFTER INSERT ON ocr_results BEGIN
+                    INSERT INTO ocr_fulltext(rowid, text) VALUES (new.id, new.raw_text);
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS ocr_results_ad AFTER DELETE ON ocr_results BEGIN
+                    INSERT INTO ocr_fulltext(ocr_fulltext, rowid, text) VALUES('delete', old.id, old.raw_text);
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS ocr_results_au AFTER UPDATE ON ocr_results BEGIN
+                    INSERT INTO ocr_fulltext(ocr_fulltext, rowid, text) VALUES('delete', old.id, old.raw_text);
+                    INSERT INTO ocr_fulltext(rowid, text) VALUES (new.id, new.raw_text);
+                END;
+                "
+            )?;
+
+            // --- Backfill FTS from existing ocr_results ---
+            self.conn.execute_batch(
+                "INSERT OR IGNORE INTO ocr_fulltext(rowid, text)
+                 SELECT id, raw_text FROM ocr_results WHERE raw_text IS NOT NULL;"
+            )?;
+
+            // --- Record migration version ---
+            self.conn.execute(
+                "INSERT INTO schema_version (version) VALUES (?1)",
+                params![2],
+            )?;
+
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT;")?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                Err(e)
+            }
+        }
+    }
+
+    // ─── Manifest Methods (original + expanded) ─────────────────────────
+
+    /// Insert or update a manifest record (backward-compatible).
     pub fn upsert_manifest(
         &self,
         id: &str,
@@ -119,6 +356,528 @@ impl StateDb {
         )?;
         Ok(())
     }
+
+    /// Insert or update a manifest with all expanded metadata fields.
+    pub fn upsert_manifest_full(&self, insert: &ManifestInsert<'_>) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO manifests (id, archive_id, title, total_canvases, json_cached, fetched_at,
+                ark_url, doc_type, archival_context, archive_db_id, locality_id,
+                signature, date_from, date_to, license, language, iiif_version, year)
+             VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'),
+                ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+             ON CONFLICT(id) DO UPDATE SET
+                archive_id = excluded.archive_id,
+                title = excluded.title,
+                total_canvases = excluded.total_canvases,
+                json_cached = COALESCE(excluded.json_cached, manifests.json_cached),
+                fetched_at = datetime('now'),
+                ark_url = COALESCE(excluded.ark_url, manifests.ark_url),
+                doc_type = COALESCE(excluded.doc_type, manifests.doc_type),
+                archival_context = COALESCE(excluded.archival_context, manifests.archival_context),
+                archive_db_id = COALESCE(excluded.archive_db_id, manifests.archive_db_id),
+                locality_id = COALESCE(excluded.locality_id, manifests.locality_id),
+                signature = COALESCE(excluded.signature, manifests.signature),
+                date_from = COALESCE(excluded.date_from, manifests.date_from),
+                date_to = COALESCE(excluded.date_to, manifests.date_to),
+                license = COALESCE(excluded.license, manifests.license),
+                language = COALESCE(excluded.language, manifests.language),
+                iiif_version = COALESCE(excluded.iiif_version, manifests.iiif_version),
+                year = COALESCE(excluded.year, manifests.year)",
+            params![
+                insert.id, insert.archive_id, insert.title,
+                insert.total_canvases.map(|v| v as i64), insert.json_cached,
+                insert.ark_url, insert.doc_type, insert.archival_context,
+                insert.archive_db_id, insert.locality_id,
+                insert.signature, insert.date_from, insert.date_to,
+                insert.license, insert.language, insert.iiif_version, insert.year,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Build a ManifestInsert from an IiifManifest and persist it along with all metadata.
+    pub fn store_manifest_from_iiif(
+        &self,
+        manifest: &IiifManifest,
+        ark_url: Option<&str>,
+    ) -> Result<()> {
+        let archive_context = manifest.archival_context();
+        let archive_name = manifest.get_metadata("Conservato da");
+
+        // Upsert archive if present
+        let archive_db_id = if let Some(name) = archive_name {
+            let slug = name.to_lowercase()
+                .replace(' ', "-")
+                .replace('\'', "");
+            Some(self.upsert_archive(name, &slug, None)?)
+        } else {
+            None
+        };
+
+        // Extract year from date range
+        let date_from = manifest.get_metadata("Estremo remoto");
+        let date_to = manifest.get_metadata("Estremo recente");
+        let year = date_from.map(|d| d.to_string())
+            .or_else(|| manifest.get_metadata("Datazione").map(|d| d.to_string()));
+
+        let insert = ManifestInsert {
+            id: &manifest.id,
+            archive_id: archive_context.unwrap_or("unknown"),
+            title: Some(manifest.title()),
+            total_canvases: Some(manifest.canvases.len()),
+            json_cached: None,
+            ark_url,
+            doc_type: manifest.doc_type(),
+            archival_context: archive_context,
+            archive_db_id,
+            locality_id: None,
+            signature: manifest.get_metadata("Segnatura attuale"),
+            date_from,
+            date_to,
+            license: manifest.get_metadata("Licenza"),
+            language: manifest.get_metadata("Lingua"),
+            iiif_version: Some(&manifest.version.to_string()),
+            year: year.as_deref(),
+        };
+
+        self.upsert_manifest_full(&insert)?;
+        self.store_manifest_metadata(&manifest.id, &manifest.metadata)?;
+
+        Ok(())
+    }
+
+    /// Store all raw metadata key-value pairs for a manifest.
+    pub fn store_manifest_metadata(&self, manifest_id: &str, metadata: &[MetadataEntry]) -> Result<()> {
+        for entry in metadata {
+            self.conn.execute(
+                "INSERT INTO manifest_metadata (manifest_id, label, value)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(manifest_id, label) DO UPDATE SET value = excluded.value",
+                params![manifest_id, entry.label, entry.value],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Get all raw metadata for a manifest.
+    pub fn get_manifest_metadata(&self, manifest_id: &str) -> Result<Vec<MetadataEntry>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT label, value FROM manifest_metadata WHERE manifest_id = ?1 ORDER BY label",
+        )?;
+        let records = stmt
+            .query_map(params![manifest_id], |row| {
+                Ok(MetadataEntry {
+                    label: row.get(0)?,
+                    value: row.get(1)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(records)
+    }
+
+    /// Search manifests by various criteria.
+    pub fn search_manifests(
+        &self,
+        doc_type: Option<&str>,
+        year: Option<&str>,
+        archive_name: Option<&str>,
+        locality: Option<&str>,
+    ) -> Result<Vec<ManifestRecord>> {
+        let mut sql = "SELECT m.id, m.archive_id, m.title, m.total_canvases, m.doc_type,
+                       m.archival_context, m.signature, m.date_from, m.date_to,
+                       m.iiif_version, m.year, m.ark_url,
+                       a.name as archive_name
+                       FROM manifests m
+                       LEFT JOIN archives a ON m.archive_db_id = a.id
+                       WHERE 1=1".to_string();
+        let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+        if let Some(dt) = doc_type {
+            sql.push_str(&format!(" AND m.doc_type = ?{}", params_vec.len() + 1));
+            params_vec.push(Box::new(dt.to_string()));
+        }
+        if let Some(y) = year {
+            sql.push_str(&format!(" AND m.year LIKE ?{}", params_vec.len() + 1));
+            params_vec.push(Box::new(format!("%{y}%")));
+        }
+        if let Some(an) = archive_name {
+            sql.push_str(&format!(" AND a.name LIKE ?{}", params_vec.len() + 1));
+            params_vec.push(Box::new(format!("%{an}%")));
+        }
+        if let Some(loc) = locality {
+            sql.push_str(&format!(" AND m.archival_context LIKE ?{}", params_vec.len() + 1));
+            params_vec.push(Box::new(format!("%{loc}%")));
+        }
+
+        sql.push_str(" ORDER BY m.year, m.doc_type");
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+        let records = stmt
+            .query_map(params_refs.as_slice(), |row| {
+                Ok(ManifestRecord {
+                    id: row.get(0)?,
+                    archive_id: row.get(1)?,
+                    title: row.get(2)?,
+                    total_canvases: row.get::<_, Option<i64>>(3)?.map(|v| v as usize),
+                    doc_type: row.get(4)?,
+                    archival_context: row.get(5)?,
+                    signature: row.get(6)?,
+                    date_from: row.get(7)?,
+                    date_to: row.get(8)?,
+                    iiif_version: row.get(9)?,
+                    year: row.get(10)?,
+                    ark_url: row.get(11)?,
+                    archive_name: row.get(12)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(records)
+    }
+
+    // ─── Archive Methods ────────────────────────────────────────────────
+
+    /// Insert or find an existing archive. Returns the archive ID.
+    pub fn upsert_archive(&self, name: &str, slug: &str, url: Option<&str>) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO archives (name, slug, url)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(slug) DO UPDATE SET
+                name = excluded.name,
+                url = COALESCE(excluded.url, archives.url),
+                updated_at = datetime('now')",
+            params![name, slug, url],
+        )?;
+
+        let id: i64 = self.conn.query_row(
+            "SELECT id FROM archives WHERE slug = ?1",
+            params![slug],
+            |row| row.get(0),
+        )?;
+        Ok(id)
+    }
+
+    /// List all known archives.
+    pub fn list_archives(&self) -> Result<Vec<ArchiveRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, slug, url FROM archives ORDER BY name",
+        )?;
+        let records = stmt
+            .query_map([], |row| {
+                Ok(ArchiveRecord {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    slug: row.get(2)?,
+                    url: row.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(records)
+    }
+
+    // ─── Locality Methods ───────────────────────────────────────────────
+
+    /// Insert or find an existing locality. Returns the locality ID.
+    pub fn upsert_locality(&self, name: &str, province: Option<&str>) -> Result<i64> {
+        let normalized = name.to_lowercase();
+        self.conn.execute(
+            "INSERT INTO localities (name, province, normalized_name)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(name, province) DO NOTHING",
+            params![name, province, normalized],
+        )?;
+
+        let id: i64 = self.conn.query_row(
+            "SELECT id FROM localities WHERE name = ?1 AND province IS ?2",
+            params![name, province],
+            |row| row.get(0),
+        )?;
+        Ok(id)
+    }
+
+    /// Search localities by name pattern.
+    pub fn search_localities(&self, pattern: &str) -> Result<Vec<LocalityRecord>> {
+        let normalized = pattern.to_lowercase();
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, province FROM localities
+             WHERE normalized_name LIKE ?1 ORDER BY name",
+        )?;
+        let records = stmt
+            .query_map(params![format!("%{normalized}%")], |row| {
+                Ok(LocalityRecord {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    province: row.get(2)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(records)
+    }
+
+    // ─── Search Query Caching ───────────────────────────────────────────
+
+    /// Record a search query. Returns the query ID.
+    pub fn insert_search_query(
+        &self,
+        query_type: &str,
+        params_json: &str,
+        total_results: Option<u32>,
+        pages_fetched: Option<u32>,
+    ) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO search_queries (query_type, params_json, total_results, pages_fetched)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![query_type, params_json, total_results, pages_fetched],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Insert a registry search result.
+    pub fn insert_registry_result(&self, query_id: i64, result: &RegistryResult) -> Result<i64> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO registry_results
+                (query_id, ark_url, year, doc_type, signature, context, archive_name, archive_url)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                query_id, result.ark_url, result.year, result.doc_type,
+                result.signature, result.context, result.archive, result.archive_url,
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Link a registry result to a manifest (after the manifest is downloaded).
+    pub fn link_registry_to_manifest(&self, ark_url: &str, manifest_id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE registry_results SET manifest_id = ?1 WHERE ark_url = ?2",
+            params![manifest_id, ark_url],
+        )?;
+        Ok(())
+    }
+
+    /// Search cached registry results locally.
+    pub fn search_registry_results(
+        &self,
+        doc_type: Option<&str>,
+        year: Option<&str>,
+        archive_name: Option<&str>,
+        locality: Option<&str>,
+    ) -> Result<Vec<RegistryResultRecord>> {
+        let mut sql = "SELECT id, ark_url, year, doc_type, signature, context,
+                       archive_name, archive_url, manifest_id
+                       FROM registry_results WHERE 1=1".to_string();
+        let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+        if let Some(dt) = doc_type {
+            sql.push_str(&format!(" AND doc_type = ?{}", params_vec.len() + 1));
+            params_vec.push(Box::new(dt.to_string()));
+        }
+        if let Some(y) = year {
+            sql.push_str(&format!(" AND year = ?{}", params_vec.len() + 1));
+            params_vec.push(Box::new(y.to_string()));
+        }
+        if let Some(an) = archive_name {
+            sql.push_str(&format!(" AND archive_name LIKE ?{}", params_vec.len() + 1));
+            params_vec.push(Box::new(format!("%{an}%")));
+        }
+        if let Some(loc) = locality {
+            sql.push_str(&format!(" AND context LIKE ?{}", params_vec.len() + 1));
+            params_vec.push(Box::new(format!("%{loc}%")));
+        }
+
+        sql.push_str(" ORDER BY year, doc_type");
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+        let records = stmt
+            .query_map(params_refs.as_slice(), |row| {
+                Ok(RegistryResultRecord {
+                    id: row.get(0)?,
+                    ark_url: row.get(1)?,
+                    year: row.get(2)?,
+                    doc_type: row.get(3)?,
+                    signature: row.get(4)?,
+                    context: row.get(5)?,
+                    archive_name: row.get(6)?,
+                    archive_url: row.get(7)?,
+                    manifest_id: row.get(8)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(records)
+    }
+
+    // ─── Person Methods ─────────────────────────────────────────────────
+
+    /// Upsert a person from name search results. Returns the person ID.
+    pub fn upsert_person(&self, result: &NameResult) -> Result<i64> {
+        // Split name into surname/given_name (heuristic: first word is surname)
+        let parts: Vec<&str> = result.name.splitn(2, ' ').collect();
+        let (surname, given_name) = if parts.len() == 2 {
+            (Some(parts[0]), Some(parts[1]))
+        } else {
+            (Some(result.name.as_str()), None)
+        };
+
+        self.conn.execute(
+            "INSERT INTO persons (name, surname, given_name, detail_url, birth_info, death_info)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(detail_url) DO UPDATE SET
+                name = excluded.name,
+                surname = excluded.surname,
+                given_name = excluded.given_name,
+                birth_info = COALESCE(excluded.birth_info, persons.birth_info),
+                death_info = COALESCE(excluded.death_info, persons.death_info),
+                updated_at = datetime('now')",
+            params![
+                result.name, surname, given_name,
+                result.detail_url, result.birth_info, result.death_info,
+            ],
+        )?;
+
+        let id: i64 = self.conn.query_row(
+            "SELECT id FROM persons WHERE detail_url = ?1",
+            params![result.detail_url],
+            |row| row.get(0),
+        )?;
+
+        // Insert linked records
+        for rec in &result.records {
+            self.conn.execute(
+                "INSERT OR IGNORE INTO person_records (person_id, record_type, date, ark_url)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![id, rec.record_type, rec.date, rec.ark_url],
+            )?;
+        }
+
+        Ok(id)
+    }
+
+    /// Record that a person appeared in a search query.
+    pub fn insert_person_search_result(
+        &self,
+        query_id: i64,
+        person_id: i64,
+        result_index: i32,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO person_search_results (query_id, person_id, result_index)
+             VALUES (?1, ?2, ?3)",
+            params![query_id, person_id, result_index],
+        )?;
+        Ok(())
+    }
+
+    /// Search persons by surname and/or name.
+    pub fn search_persons(
+        &self,
+        surname: Option<&str>,
+        given_name: Option<&str>,
+    ) -> Result<Vec<PersonRecord>> {
+        let mut sql = "SELECT id, name, surname, given_name, detail_url,
+                       birth_info, death_info
+                       FROM persons WHERE 1=1".to_string();
+        let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+        if let Some(s) = surname {
+            sql.push_str(&format!(" AND surname LIKE ?{}", params_vec.len() + 1));
+            params_vec.push(Box::new(format!("%{s}%")));
+        }
+        if let Some(n) = given_name {
+            sql.push_str(&format!(" AND given_name LIKE ?{}", params_vec.len() + 1));
+            params_vec.push(Box::new(format!("%{n}%")));
+        }
+
+        sql.push_str(" ORDER BY surname, given_name");
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+        let records = stmt
+            .query_map(params_refs.as_slice(), |row| {
+                Ok(PersonRecord {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    surname: row.get(2)?,
+                    given_name: row.get(3)?,
+                    detail_url: row.get(4)?,
+                    birth_info: row.get(5)?,
+                    death_info: row.get(6)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(records)
+    }
+
+    /// Get all records linked to a person.
+    pub fn get_person_records(&self, person_id: i64) -> Result<Vec<PersonRecordEntry>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, record_type, date, ark_url, manifest_id
+             FROM person_records WHERE person_id = ?1 ORDER BY date",
+        )?;
+        let records = stmt
+            .query_map(params![person_id], |row| {
+                Ok(PersonRecordEntry {
+                    id: row.get(0)?,
+                    record_type: row.get(1)?,
+                    date: row.get(2)?,
+                    ark_url: row.get(3)?,
+                    manifest_id: row.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(records)
+    }
+
+    // ─── OCR Full-Text Search ───────────────────────────────────────────
+
+    /// Full-text search on OCR results. Returns matching records with context.
+    pub fn search_ocr_text(&self, query: &str, limit: usize) -> Result<Vec<OcrSearchResult>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT o.id, o.download_id, o.backend, snippet(ocr_fulltext, 0, '>>>', '<<<', '...', 40) as snippet,
+                    d.manifest_id, d.canvas_id, d.canvas_index, d.canvas_label,
+                    m.title as manifest_title
+             FROM ocr_fulltext ft
+             JOIN ocr_results o ON ft.rowid = o.id
+             JOIN downloads d ON o.download_id = d.id
+             JOIN manifests m ON d.manifest_id = m.id
+             WHERE ocr_fulltext MATCH ?1
+             ORDER BY rank
+             LIMIT ?2",
+        )?;
+
+        let records = stmt
+            .query_map(params![query, limit as i64], |row| {
+                Ok(OcrSearchResult {
+                    ocr_id: row.get(0)?,
+                    download_id: row.get(1)?,
+                    backend: row.get(2)?,
+                    snippet: row.get(3)?,
+                    manifest_id: row.get(4)?,
+                    canvas_id: row.get(5)?,
+                    canvas_index: row.get::<_, i64>(6)? as usize,
+                    canvas_label: row.get(7)?,
+                    manifest_title: row.get(8)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(records)
+    }
+
+    /// Rebuild the FTS index from existing OCR results.
+    pub fn rebuild_fts_index(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "DELETE FROM ocr_fulltext;
+             INSERT INTO ocr_fulltext(rowid, text)
+             SELECT id, raw_text FROM ocr_results WHERE raw_text IS NOT NULL;"
+        )?;
+        Ok(())
+    }
+
+    // ─── Download Methods (original) ────────────────────────────────────
 
     /// Create a new download session.
     pub fn create_session(&self, manifest_id: &str, config_snapshot: Option<&str>) -> Result<i64> {
@@ -141,6 +900,33 @@ impl StateDb {
             "INSERT OR IGNORE INTO downloads (manifest_id, canvas_id, canvas_index, image_url, status)
              VALUES (?1, ?2, ?3, ?4, 'pending')",
             params![manifest_id, canvas_id, canvas_index as i64, image_url],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Insert a pending download record with canvas metadata.
+    pub fn insert_download_full(
+        &self,
+        manifest_id: &str,
+        canvas_id: &str,
+        canvas_index: usize,
+        image_url: &str,
+        canvas_label: Option<&str>,
+        width: Option<u32>,
+        height: Option<u32>,
+    ) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO downloads (manifest_id, canvas_id, canvas_index, image_url, status,
+                canvas_label, width, height)
+             VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7)
+             ON CONFLICT(manifest_id, canvas_id) DO UPDATE SET
+                canvas_label = COALESCE(excluded.canvas_label, downloads.canvas_label),
+                width = COALESCE(excluded.width, downloads.width),
+                height = COALESCE(excluded.height, downloads.height)",
+            params![
+                manifest_id, canvas_id, canvas_index as i64, image_url,
+                canvas_label, width, height,
+            ],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
@@ -239,6 +1025,8 @@ impl StateDb {
             pending: pending as usize,
         })
     }
+
+    // ─── Tag Methods (original) ─────────────────────────────────────────
 
     /// Insert a tag for a download.
     pub fn insert_tag(
@@ -362,6 +1150,8 @@ impl StateDb {
             .map_err(Into::into)
     }
 
+    // ─── Session & Stats Methods (original + expanded) ──────────────────
+
     /// List all sessions with summary info.
     pub fn list_sessions(&self) -> Result<Vec<SessionRecord>> {
         let mut stmt = self.conn.prepare(
@@ -458,6 +1248,62 @@ impl StateDb {
             tags: tags as usize,
         })
     }
+
+    /// Get expanded stats including archives, persons, OCR, and search data.
+    pub fn get_extended_stats(&self) -> Result<ExtendedStats> {
+        let base = self.get_global_stats()?;
+        let archives: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM archives", [], |row| row.get(0),
+        )?;
+        let persons: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM persons", [], |row| row.get(0),
+        )?;
+        let search_queries: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM search_queries", [], |row| row.get(0),
+        )?;
+        let registry_results: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM registry_results", [], |row| row.get(0),
+        )?;
+        let ocr_results: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM ocr_results", [], |row| row.get(0),
+        )?;
+        let localities: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM localities", [], |row| row.get(0),
+        )?;
+
+        Ok(ExtendedStats {
+            base,
+            archives: archives as usize,
+            localities: localities as usize,
+            persons: persons as usize,
+            search_queries: search_queries as usize,
+            registry_results: registry_results as usize,
+            ocr_results: ocr_results as usize,
+        })
+    }
+}
+
+// ─── Data Structures ────────────────────────────────────────────────────
+
+/// Input for upsert_manifest_full.
+pub struct ManifestInsert<'a> {
+    pub id: &'a str,
+    pub archive_id: &'a str,
+    pub title: Option<&'a str>,
+    pub total_canvases: Option<usize>,
+    pub json_cached: Option<&'a str>,
+    pub ark_url: Option<&'a str>,
+    pub doc_type: Option<&'a str>,
+    pub archival_context: Option<&'a str>,
+    pub archive_db_id: Option<i64>,
+    pub locality_id: Option<i64>,
+    pub signature: Option<&'a str>,
+    pub date_from: Option<&'a str>,
+    pub date_to: Option<&'a str>,
+    pub license: Option<&'a str>,
+    pub language: Option<&'a str>,
+    pub iiif_version: Option<&'a str>,
+    pub year: Option<&'a str>,
 }
 
 #[derive(Debug, Clone)]
@@ -519,6 +1365,95 @@ pub struct GlobalStats {
     pub tags: usize,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ExtendedStats {
+    pub base: GlobalStats,
+    pub archives: usize,
+    pub localities: usize,
+    pub persons: usize,
+    pub search_queries: usize,
+    pub registry_results: usize,
+    pub ocr_results: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ManifestRecord {
+    pub id: String,
+    pub archive_id: String,
+    pub title: Option<String>,
+    pub total_canvases: Option<usize>,
+    pub doc_type: Option<String>,
+    pub archival_context: Option<String>,
+    pub signature: Option<String>,
+    pub date_from: Option<String>,
+    pub date_to: Option<String>,
+    pub iiif_version: Option<String>,
+    pub year: Option<String>,
+    pub ark_url: Option<String>,
+    pub archive_name: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ArchiveRecord {
+    pub id: i64,
+    pub name: String,
+    pub slug: String,
+    pub url: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LocalityRecord {
+    pub id: i64,
+    pub name: String,
+    pub province: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RegistryResultRecord {
+    pub id: i64,
+    pub ark_url: String,
+    pub year: Option<String>,
+    pub doc_type: Option<String>,
+    pub signature: Option<String>,
+    pub context: Option<String>,
+    pub archive_name: Option<String>,
+    pub archive_url: Option<String>,
+    pub manifest_id: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PersonRecord {
+    pub id: i64,
+    pub name: String,
+    pub surname: Option<String>,
+    pub given_name: Option<String>,
+    pub detail_url: Option<String>,
+    pub birth_info: Option<String>,
+    pub death_info: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PersonRecordEntry {
+    pub id: i64,
+    pub record_type: Option<String>,
+    pub date: Option<String>,
+    pub ark_url: Option<String>,
+    pub manifest_id: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct OcrSearchResult {
+    pub ocr_id: i64,
+    pub download_id: i64,
+    pub backend: String,
+    pub snippet: String,
+    pub manifest_id: String,
+    pub canvas_id: String,
+    pub canvas_index: usize,
+    pub canvas_label: Option<String>,
+    pub manifest_title: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -526,7 +1461,6 @@ mod tests {
     #[test]
     fn test_schema_creation() {
         let db = StateDb::in_memory().unwrap();
-        // Schema should be created without errors
         db.upsert_manifest("test-manifest", "archive-1", Some("Test"), 10, None)
             .unwrap();
     }
@@ -581,5 +1515,161 @@ mod tests {
         let session_id = db.create_session("m1", Some("{}")).unwrap();
         assert!(session_id > 0);
         db.update_session_status(session_id, "complete").unwrap();
+    }
+
+    #[test]
+    fn test_archives() {
+        let db = StateDb::in_memory().unwrap();
+
+        let id1 = db.upsert_archive("Archivio di Stato di Lucca", "archivio-di-stato-di-lucca", None).unwrap();
+        let id2 = db.upsert_archive("Archivio di Stato di Napoli", "archivio-di-stato-di-napoli", Some("https://example.com")).unwrap();
+        assert_ne!(id1, id2);
+
+        // Upsert same slug returns same id
+        let id3 = db.upsert_archive("Archivio di Stato di Lucca", "archivio-di-stato-di-lucca", None).unwrap();
+        assert_eq!(id1, id3);
+
+        let archives = db.list_archives().unwrap();
+        assert_eq!(archives.len(), 2);
+    }
+
+    #[test]
+    fn test_localities() {
+        let db = StateDb::in_memory().unwrap();
+
+        let id1 = db.upsert_locality("Camposano", Some("NA")).unwrap();
+        let id2 = db.upsert_locality("Lucca", Some("LU")).unwrap();
+        assert_ne!(id1, id2);
+
+        let results = db.search_localities("campo").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "Camposano");
+    }
+
+    #[test]
+    fn test_search_query_caching() {
+        let db = StateDb::in_memory().unwrap();
+
+        let query_id = db.insert_search_query("registry", "{\"locality\":\"Camposano\"}", Some(42), Some(1)).unwrap();
+        assert!(query_id > 0);
+
+        let result = RegistryResult {
+            ark_url: "https://antenati.cultura.gov.it/ark:/12657/an_ua18771".to_string(),
+            year: "1810".to_string(),
+            doc_type: "Nati".to_string(),
+            signature: "82.1422".to_string(),
+            context: "Stato civile napoleonico > Camposano".to_string(),
+            archive: "Archivio di Stato di Napoli".to_string(),
+            archive_url: None,
+        };
+
+        db.insert_registry_result(query_id, &result).unwrap();
+
+        let results = db.search_registry_results(Some("Nati"), None, None, None).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].year, Some("1810".to_string()));
+    }
+
+    #[test]
+    fn test_persons() {
+        let db = StateDb::in_memory().unwrap();
+
+        let name_result = NameResult {
+            name: "ROSSI Mario".to_string(),
+            detail_url: "/detail-nominative/?s_id=123".to_string(),
+            birth_info: Some("Camposano, 1810".to_string()),
+            death_info: None,
+            records: vec![
+                crate::models::search::LinkedRecord {
+                    record_type: "Atto di nascita".to_string(),
+                    date: Some("1810".to_string()),
+                    ark_url: Some("ark:/12657/an_ua18771".to_string()),
+                },
+            ],
+        };
+
+        let person_id = db.upsert_person(&name_result).unwrap();
+        assert!(person_id > 0);
+
+        let persons = db.search_persons(Some("ROSSI"), None).unwrap();
+        assert_eq!(persons.len(), 1);
+        assert_eq!(persons[0].name, "ROSSI Mario");
+
+        let records = db.get_person_records(person_id).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].record_type, Some("Atto di nascita".to_string()));
+    }
+
+    #[test]
+    fn test_manifest_metadata() {
+        let db = StateDb::in_memory().unwrap();
+        db.upsert_manifest("m1", "a1", Some("Test"), 1, None).unwrap();
+
+        let metadata = vec![
+            MetadataEntry { label: "Tipologia".to_string(), value: "Nati".to_string() },
+            MetadataEntry { label: "Contesto archivistico".to_string(), value: "Stato civile > Camposano".to_string() },
+        ];
+
+        db.store_manifest_metadata("m1", &metadata).unwrap();
+
+        let result = db.get_manifest_metadata("m1").unwrap();
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn test_extended_stats() {
+        let db = StateDb::in_memory().unwrap();
+        let stats = db.get_extended_stats().unwrap();
+        assert_eq!(stats.base.manifests, 0);
+        assert_eq!(stats.archives, 0);
+        assert_eq!(stats.persons, 0);
+    }
+
+    #[test]
+    fn test_insert_download_full() {
+        let db = StateDb::in_memory().unwrap();
+        db.upsert_manifest("m1", "a1", Some("Test"), 1, None).unwrap();
+
+        let dl_id = db.insert_download_full(
+            "m1", "c1", 0, "http://example.com/1.jpg",
+            Some("pag. 1"), Some(4000), Some(3000),
+        ).unwrap();
+        assert!(dl_id > 0);
+    }
+
+    #[test]
+    fn test_search_manifests() {
+        let db = StateDb::in_memory().unwrap();
+
+        let archive_id = db.upsert_archive("Archivio di Stato di Napoli", "archivio-di-stato-di-napoli", None).unwrap();
+
+        let insert = ManifestInsert {
+            id: "m1",
+            archive_id: "context",
+            title: Some("Registro Nati 1810"),
+            total_canvases: Some(50),
+            json_cached: None,
+            ark_url: Some("ark:/12657/an_ua18771"),
+            doc_type: Some("Nati"),
+            archival_context: Some("Stato civile napoleonico > Camposano"),
+            archive_db_id: Some(archive_id),
+            locality_id: None,
+            signature: Some("82.1422"),
+            date_from: Some("1810"),
+            date_to: Some("1810"),
+            license: None,
+            language: None,
+            iiif_version: Some("v2"),
+            year: Some("1810"),
+        };
+
+        db.upsert_manifest_full(&insert).unwrap();
+
+        let results = db.search_manifests(Some("Nati"), None, None, None).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].doc_type, Some("Nati".to_string()));
+
+        let results = db.search_manifests(None, None, Some("Napoli"), None).unwrap();
+        assert_eq!(results.len(), 1);
     }
 }
