@@ -13,6 +13,9 @@ High-performance Rust CLI for downloading genealogical records from [Portale Ant
 - **SQLite state tracking** for download resume, session history, and local tag search
 - **Graceful shutdown** — Ctrl+C saves progress, resume later with `--resume`
 - **WAF handling** — automatic detection and resolution of AWS WAF challenges
+- **Interactive dashboard** — real-time TUI showing download progress, stats, and disk usage
+- **Thumbnail generation** — batch create JPEG thumbnails from downloaded images
+- **Integrity verification** — SHA256 checksum validation with auto-fix for corrupted downloads
 - **JSON output** — `--json` flag on every command for scripting and pipelines
 
 ## Quick Start
@@ -205,6 +208,84 @@ rustenati status --all
 rustenati status --session 5
 ```
 
+## Verify
+
+```bash
+# Full integrity check (SHA256 verification against DB)
+rustenati verify
+
+# Quick check (existence + non-zero size only, skip SHA256)
+rustenati verify --quick
+
+# Verify a specific manifest
+rustenati verify --manifest <MANIFEST_ID>
+
+# Auto-fix: re-queue corrupted/missing files for re-download
+rustenati verify --fix
+rustenati verify --fix --quick    # fast fix pass
+
+# JSON output for scripting
+rustenati verify --json
+```
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--quick` | off | Skip SHA256, only check file existence and non-zero size |
+| `--fix` | off | Reset missing/corrupted files to pending for re-download |
+| `--manifest <ID>` | all | Limit verification to a specific manifest |
+
+## Thumbnails
+
+```bash
+# Generate thumbnails for all downloaded images
+rustenati thumbnail
+
+# Custom dimensions
+rustenati thumbnail --width 300 --height 300
+
+# Regenerate all (including existing)
+rustenati thumbnail --force
+
+# Only for a specific manifest
+rustenati thumbnail --manifest <MANIFEST_ID>
+
+# Adjust JPEG quality
+rustenati thumbnail --quality 60
+```
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `-W, --width` | 200 | Maximum thumbnail width in pixels |
+| `-H, --height` | 200 | Maximum thumbnail height in pixels |
+| `--quality` | 80 | JPEG quality (1-100) |
+| `--manifest <ID>` | all | Only process a specific manifest |
+| `--force` | off | Regenerate existing thumbnails |
+
+Thumbnails are saved in a `thumbnails/` directory alongside `images/` in each registry folder.
+
+## Dashboard
+
+Interactive TUI for real-time monitoring of download progress and database statistics.
+
+```bash
+# Launch the dashboard
+rustenati dashboard
+
+# Custom refresh interval
+rustenati dashboard --refresh 5
+```
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--refresh` | 2 | Refresh interval in seconds |
+
+The dashboard displays:
+- **Overview**: manifest count, archives, registries, downloads (complete/pending/failed), tags, OCR results, disk usage
+- **Progress gauge**: visual download completion percentage
+- **Recent manifests table**: latest manifests with doc type, year, status, and per-manifest progress
+
+**Keys**: `q` or `Esc` to quit, `r` to force refresh.
+
 ## Configuration
 
 ```bash
@@ -238,6 +319,10 @@ antenati/
 │   ├── manifest.json       # IIIF manifest
 │   ├── metadata.json       # Download metadata (date, version, etc.)
 │   ├── images/
+│   │   ├── 001_pag. 1.jpg
+│   │   ├── 002_pag. 2.jpg
+│   │   └── ...
+│   ├── thumbnails/
 │   │   ├── 001_pag. 1.jpg
 │   │   ├── 002_pag. 2.jpg
 │   │   └── ...
