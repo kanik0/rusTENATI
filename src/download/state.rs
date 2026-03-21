@@ -870,14 +870,14 @@ impl StateDb {
         }
         if let Some(true) = has_images {
             where_clause.push_str(
-                " AND EXISTS (SELECT 1 FROM manifests m JOIN downloads d ON d.manifest_id = m.id \
-                 WHERE m.ark_url = r.ark_url AND d.status = 'complete')"
+                " AND r.ark_url IN (SELECT DISTINCT m.ark_url FROM manifests m \
+                 JOIN downloads d ON d.manifest_id = m.id WHERE d.status = 'complete')"
             );
         }
         if let Some(false) = has_images {
             where_clause.push_str(
-                " AND NOT EXISTS (SELECT 1 FROM manifests m JOIN downloads d ON d.manifest_id = m.id \
-                 WHERE m.ark_url = r.ark_url AND d.status = 'complete')"
+                " AND r.ark_url NOT IN (SELECT DISTINCT m.ark_url FROM manifests m \
+                 JOIN downloads d ON d.manifest_id = m.id WHERE d.status = 'complete')"
             );
         }
 
@@ -890,8 +890,8 @@ impl StateDb {
         let data_sql = format!(
             "SELECT r.id, r.ark_url, r.year, r.doc_type, r.signature, r.context,
                     r.archive_name, r.locality_name, r.province, r.updated_at,
-                    EXISTS (SELECT 1 FROM manifests m JOIN downloads d ON d.manifest_id = m.id
-                            WHERE m.ark_url = r.ark_url AND d.status = 'complete') as has_images
+                    r.ark_url IN (SELECT DISTINCT m.ark_url FROM manifests m
+                            JOIN downloads d ON d.manifest_id = m.id WHERE d.status = 'complete') as has_images
              FROM registries r
              {where_clause}
              ORDER BY r.year, r.doc_type
