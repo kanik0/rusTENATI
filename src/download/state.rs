@@ -890,8 +890,8 @@ impl StateDb {
         let data_sql = format!(
             "SELECT r.id, r.ark_url, r.year, r.doc_type, r.signature, r.context,
                     r.archive_name, r.locality_name, r.province, r.updated_at,
-                    r.ark_url IN (SELECT DISTINCT m.ark_url FROM manifests m
-                            JOIN downloads d ON d.manifest_id = m.id WHERE d.status = 'complete') as has_images
+                    EXISTS (SELECT 1 FROM manifests m JOIN downloads d ON d.manifest_id = m.id
+                            WHERE m.ark_url = r.ark_url AND d.status = 'complete') as has_images
              FROM registries r
              {where_clause}
              ORDER BY r.year, r.doc_type
