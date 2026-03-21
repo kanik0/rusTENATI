@@ -195,12 +195,32 @@ Il sito usa cookies per sessione. Un cookie store persistente è necessario.
 ### reCAPTCHA
 La pagina di ricerca include Google reCAPTCHA. Non è attivato per navigazione normale ma potrebbe scattare con traffico elevato.
 
+### Rate Limiting e Retry
+
+Il server risponde con **HTTP 503** (Service Unavailable) o **HTTP 429** (Too Many Requests)
+quando si superano i limiti di richieste. Entrambe le risposte possono includere un header
+`Retry-After` con il numero di secondi da attendere prima di riprovare.
+
+Rustenati gestisce automaticamente questi errori su tutti i flussi:
+- **Chiamate API** (search, info, browse, suggest): retry automatico con backoff esponenziale
+  (default: 3 tentativi, backoff iniziale 1s, cap 30s, jitter ±25%)
+- **Download immagini**: retry con backoff esponenziale + circuit breaker per-dominio
+  (default: 5 tentativi, backoff iniziale 1s, cap 30s)
+
+Configurazione nel file `config.toml`:
+```toml
+[http]
+api_max_retries = 3           # Tentativi per chiamate API
+api_initial_backoff_ms = 1000 # Backoff iniziale in ms
+max_retries = 5               # Tentativi per download immagini
+```
+
 ### Best Practices
 - Delay tra richieste: minimo 500ms
 - Parallelismo: max 4-8 richieste contemporanee
 - Cookie jar persistente
 - User-Agent realistico (Chrome/Firefox)
-- Rispettare 429 (retry-after)
+- Rispettare 429 e 503 (retry-after) — gestito automaticamente da Rustenati
 
 ## Numeri
 

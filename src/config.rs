@@ -34,6 +34,10 @@ pub struct HttpConfig {
     pub pool_idle_timeout_secs: u64,
     /// Enable TCP keepalive (seconds)
     pub tcp_keepalive_secs: Option<u64>,
+    /// Max retries for API calls (search, info, browse) on 5xx/429 errors
+    pub api_max_retries: u32,
+    /// Initial backoff in ms for API call retries (doubles each attempt, capped at 30s)
+    pub api_initial_backoff_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,6 +122,8 @@ impl Default for HttpConfig {
             pool_max_idle_per_host: 10,
             pool_idle_timeout_secs: 90,
             tcp_keepalive_secs: Some(60),
+            api_max_retries: 3,
+            api_initial_backoff_ms: 1000,
         }
     }
 }
