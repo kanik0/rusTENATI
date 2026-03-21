@@ -217,6 +217,7 @@ async fn run_batch_download(
     let mut all_results = Vec::new();
     let mut page = 1u32;
     let page_size = 100u32;
+    let filter_lower = args.filter.as_ref().map(|f| f.to_lowercase());
 
     loop {
         let params = RegistrySearchParams {
@@ -233,7 +234,15 @@ async fn run_batch_download(
         let results = client.search_registries_params(&params).await?;
 
         let total_pages = results.total_pages;
-        all_results.extend(results.results);
+
+        if let Some(ref filter) = filter_lower {
+            all_results.extend(results.results.into_iter().filter(|r| {
+                let loc = r.context.rsplit(" > ").next().unwrap_or(&r.context).trim();
+                loc.to_lowercase().contains(filter)
+            }));
+        } else {
+            all_results.extend(results.results);
+        }
 
         if page >= total_pages {
             break;
@@ -246,14 +255,6 @@ async fn run_batch_download(
 
     if !args.all {
         all_results.truncate(args.max_registries);
-    }
-
-    if let Some(filter) = &args.filter {
-        let filter_lower = filter.to_lowercase();
-        all_results.retain(|r| {
-            let loc = r.context.rsplit(" > ").next().unwrap_or(&r.context).trim();
-            loc.to_lowercase().contains(&filter_lower)
-        });
     }
 
     let total_registries = all_results.len();
