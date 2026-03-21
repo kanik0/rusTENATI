@@ -3,10 +3,12 @@
 ## Diagramma dei Moduli
 
 ```
-┌─────────────────────────────────────────────────────┐
-│                      CLI (clap)                     │
-│  search │ download │ info │ ocr │ tags │ status     │
-└────────────────────┬────────────────────────────────┘
+┌──────────────────────────────────────────────────────┐
+│                      CLI (clap)                      │
+│  search │ browse │ download │ info │ ocr │ tags      │
+│  status │ config │ query │ serve │ verify │ export   │
+│  thumbnail │ link │ dashboard                        │
+└─────────────────────┬────────────────────────────────┘
                      │
         ┌────────────┼────────────────┐
         ▼            ▼                ▼
@@ -69,6 +71,28 @@ Gestione configurazione.
 ```
 rustenati config show
 rustenati config init
+```
+
+### `verify` (funzionante)
+Verifica l'integrità dei file scaricati tramite SHA256.
+```
+rustenati verify                      # verifica completa
+rustenati verify --quick              # solo esistenza + dimensione
+rustenati verify --fix                # riaccoda file corrotti per ri-download
+```
+
+### `thumbnail` (funzionante)
+Genera miniature JPEG dai file immagine scaricati.
+```
+rustenati thumbnail                   # genera miniature (200x200)
+rustenati thumbnail --width 300 --height 300 --quality 60
+```
+
+### `dashboard` (funzionante)
+Dashboard TUI interattiva per monitorare download e statistiche in tempo reale.
+```
+rustenati dashboard                   # avvia la dashboard
+rustenati dashboard --refresh 5       # intervallo di aggiornamento personalizzato
 ```
 
 ## Flusso Download
@@ -162,6 +186,9 @@ output/{archive}/{register}/
 ├── images/
 │   ├── 001_pag. 1.jpg
 │   ├── 002_pag. 2.jpg
+│   └── ...
+├── thumbnails/
+│   ├── 001_pag. 1.jpg
 │   └── ...
 └── ocr/                # (reserved for OCR results)
 ```

@@ -24,7 +24,7 @@ Single binary crate. Key modules:
 - `download/` - parallel download engine with SQLite state tracking
 - `ocr/` - pluggable OCR backends (trait-based)
 - `models/` - data structures for manifests, search results, ARK identifiers
-- `cli/` - clap command definitions
+- `cli/` - clap command definitions: search, browse, download, info, ocr, tags, status, config, query, serve, verify, export, thumbnail, link, dashboard
 
 ## Portale Antenati API
 
