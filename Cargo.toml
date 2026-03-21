@@ -1,6 +1,6 @@
 [package]
 name = "rustenati"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "High-performance CLI for dumping Italian genealogical records from Portale Antenati"
 license = "MIT"
@@ -65,6 +65,12 @@ async-trait = "0.1"
 
 # Base64 encoding (for OCR image upload)
 base64 = "0.22"
+
+# Web server (for `serve` command)
+axum = "0.8"
+tower-http = { version = "0.6", features = ["fs", "cors"] }
+rust-embed = "8"
+mime_guess = "2"
 
 [dev-dependencies]
 tempfile = "3"

@@ -22,16 +22,20 @@ jobs:
         run: |
           VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
           echo "cargo_version=$VERSION" >> "$GITHUB_OUTPUT"
+          # Extract major.minor prefix (e.g., "0.2" from "0.2.0")
+          MAJOR_MINOR=$(echo "$VERSION" | sed 's/\.[^.]*$//')
+          echo "major_minor=$MAJOR_MINOR" >> "$GITHUB_OUTPUT"
 
       - name: Compute next release number
         id: release_number
         env:
           GH_TOKEN: ${{ github.token }}
-          CARGO_VERSION: ${{ steps.version.outputs.cargo_version }}
+          MAJOR_MINOR: ${{ steps.version.outputs.major_minor }}
         run: |
-          LAST_N=$(gh release list --json tagName --jq "[.[] | .tagName | select(startswith(\"v${CARGO_VERSION}.\")) | ltrimstr(\"v${CARGO_VERSION}.\") | tonumber] | max // 0")
-          NEXT_N=$((LAST_N + 1))
-          TAG="v${CARGO_VERSION}.${NEXT_N}"
+          # Find latest patch version for this major.minor (e.g., v0.2.*)
+          LAST_PATCH=$(gh release list --json tagName --jq "[.[] | .tagName | select(startswith(\"v${MAJOR_MINOR}.\")) | ltrimstr(\"v${MAJOR_MINOR}.\") | tonumber] | max // 0")
+          NEXT_PATCH=$((LAST_PATCH + 1))
+          TAG="v${MAJOR_MINOR}.${NEXT_PATCH}"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "Next release: $TAG"
 

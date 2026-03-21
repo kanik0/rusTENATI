@@ -8,8 +8,7 @@ pub use rustenati::error;
 pub use rustenati::models;
 pub use rustenati::ocr;
 pub use rustenati::output;
-
-use std::path::PathBuf;
+pub use rustenati::web;
 
 use anyhow::Result;
 use clap::Parser;
@@ -93,14 +92,15 @@ async fn main() -> Result<()> {
         Command::Query { action } => {
             cli::commands::query::run(action, cli.json)?;
         }
+        Command::Serve(args) => {
+            cli::commands::serve::run(args).await?;
+        }
     }
 
     Ok(())
 }
 
-/// Open the default state database at ./antenati/rustenati.db.
-/// Returns Ok if the database opens (or is created), Err if it fails.
+/// Open the state database at the fixed path ./antenati/rustenati.db.
 fn open_default_state_db() -> Result<StateDb> {
-    let db_path = PathBuf::from("./antenati/rustenati.db");
-    StateDb::open(&db_path)
+    StateDb::open(&output::db_path())
 }

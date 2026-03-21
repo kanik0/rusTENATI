@@ -2,7 +2,7 @@
 # Copy to ~/.config/rustenati/config.toml
 
 [download]
-output_dir = "./antenati"
+# Output is always ./antenati (not configurable)
 concurrency = 4
 delay_ms = 500
 quality = "full"

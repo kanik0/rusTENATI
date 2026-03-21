@@ -7,6 +7,7 @@ use comfy_table::{presets::UTF8_FULL_CONDENSED, Table};
 use crate::config::OcrConfig;
 use crate::download::state::StateDb;
 use crate::ocr::{self, DocumentType};
+use crate::output;
 
 #[derive(Debug, Subcommand)]
 pub enum TagsAction {
@@ -51,10 +52,6 @@ pub struct TagsSearchArgs {
     /// Filter by value (substring match)
     #[arg(long)]
     pub value: Option<String>,
-
-    /// Database path
-    #[arg(long, default_value = "./antenati/rustenati.db")]
-    pub db: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -62,10 +59,6 @@ pub struct TagsListArgs {
     /// Download ID to list tags for
     #[arg(long)]
     pub download_id: i64,
-
-    /// Database path
-    #[arg(long, default_value = "./antenati/rustenati.db")]
-    pub db: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -84,10 +77,6 @@ pub struct TagsAddArgs {
     /// Confidence score (0.0-1.0)
     #[arg(long)]
     pub confidence: Option<f32>,
-
-    /// Database path
-    #[arg(long, default_value = "./antenati/rustenati.db")]
-    pub db: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -98,10 +87,6 @@ pub struct TagsExtractArgs {
     /// OCR backend to use for tag extraction (default: claude)
     #[arg(long)]
     pub backend: Option<String>,
-
-    /// Database path (to store extracted tags)
-    #[arg(long, default_value = "./antenati/rustenati.db")]
-    pub db: PathBuf,
 
     /// Document type hint: birth, death, marriage
     #[arg(long)]
@@ -121,7 +106,7 @@ pub async fn run(action: &TagsAction, json_output: bool, ocr_config: &OcrConfig)
 fn open_db(path: &std::path::Path) -> Result<StateDb> {
     if !path.exists() {
         anyhow::bail!(
-            "Database not found at {}. Run a download first or specify --db path.",
+            "Database not found at {}. Run a download first.",
             path.display()
         );
     }
@@ -129,7 +114,7 @@ fn open_db(path: &std::path::Path) -> Result<StateDb> {
 }
 
 fn run_search(args: &TagsSearchArgs, json_output: bool) -> Result<()> {
-    let db = open_db(&args.db)?;
+    let db = open_db(&output::db_path())?;
 
     let searches: Vec<(Option<&str>, Option<&str>)> = if args.surname.is_some()
         || args.name.is_some()
@@ -204,7 +189,7 @@ fn run_search(args: &TagsSearchArgs, json_output: bool) -> Result<()> {
 }
 
 fn run_list(args: &TagsListArgs, json_output: bool) -> Result<()> {
-    let db = open_db(&args.db)?;
+    let db = open_db(&output::db_path())?;
     let tags = db.get_tags_for_download(args.download_id)?;
 
     if json_output {
@@ -257,7 +242,7 @@ fn run_add(args: &TagsAddArgs, json_output: bool) -> Result<()> {
         );
     }
 
-    let db = open_db(&args.db)?;
+    let db = open_db(&output::db_path())?;
     db.insert_tag(
         args.download_id,
         &args.tag_type,
@@ -480,8 +465,7 @@ fn collect_txt_files(path: &std::path::Path) -> Result<Vec<PathBuf>> {
 }
 
 fn run_stats(json_output: bool) -> Result<()> {
-    let db_path = PathBuf::from("./antenati/rustenati.db");
-    let db = open_db(&db_path)?;
+    let db = open_db(&output::db_path())?;
 
     let stats = db.get_tag_stats()?;
     let total = db.get_total_tag_count()?;

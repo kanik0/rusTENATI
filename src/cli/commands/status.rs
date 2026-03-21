@@ -1,10 +1,9 @@
-use std::path::PathBuf;
-
 use anyhow::Result;
 use clap::Args;
 use comfy_table::{presets::UTF8_FULL_CONDENSED, Table};
 
 use crate::download::state::StateDb;
+use crate::output;
 
 #[derive(Debug, Args)]
 pub struct StatusArgs {
@@ -15,14 +14,11 @@ pub struct StatusArgs {
     /// Show all sessions
     #[arg(long)]
     pub all: bool,
-
-    /// Database path
-    #[arg(long, default_value = "./antenati/rustenati.db")]
-    pub db: PathBuf,
 }
 
 pub async fn run(args: &StatusArgs, json_output: bool) -> Result<()> {
-    if !args.db.exists() {
+    let db_path = output::db_path();
+    if !db_path.exists() {
         if json_output {
             println!(
                 "{}",
@@ -31,12 +27,12 @@ pub async fn run(args: &StatusArgs, json_output: bool) -> Result<()> {
                 })
             );
         } else {
-            println!("No database found at {}. Run a download first.", args.db.display());
+            println!("No database found at {}. Run a download first.", db_path.display());
         }
         return Ok(());
     }
 
-    let db = StateDb::open(&args.db)?;
+    let db = StateDb::open(&db_path)?;
 
     if let Some(session_id) = args.session {
         return show_session(&db, session_id, json_output);

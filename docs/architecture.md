@@ -49,7 +49,7 @@ rustenati search name --surname Rossi --name Mario --locality Napoli
 ### `download` (funzionante)
 Scarica immagini da un singolo manifest o ARK URL.
 ```
-rustenati download <source> --pages 1-5 -o ./output
+rustenati download <source> --pages 1-5
 ```
 
 ### `download --search` (funzionante)
