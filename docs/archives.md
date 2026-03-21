@@ -8,6 +8,7 @@ Use the archive name or slug with `--archive`:
 rustenati search registry --archive "Archivio di Stato di Lucca" --all
 rustenati search registry --archive archivio-di-stato-di-lucca --all
 rustenati download --search --archive archivio-di-stato-di-lucca --max-registries 5000
+rustenati download --search --archive archivio-di-stato-di-massa --doc-type Nati --filter massa --all
 ```
 
 ## Full list
