@@ -114,12 +114,37 @@ rustenati config init
 5. (opzionale) Utente seleziona risultato → download
 ```
 
+## Gestione Errori e Retry
+
+Architettura a due livelli per gestire errori transitori del server (503, 429, 5xx):
+
+### Livello 1: Client API (`get_with_retry`)
+Tutte le chiamate HTTP in `AntenatiClient` (search, info, browse, suggest, manifest)
+passano attraverso `get_with_retry()`, che gestisce automaticamente:
+- **HTTP 503 / 5xx**: retry con backoff esponenziale + jitter (±25%)
+- **HTTP 429**: retry con rispetto dell'header `Retry-After`
+- **Header `Retry-After`**: parsato sia da 503 che da 429, usato come floor per il wait
+- **Configurabile**: `api_max_retries` (default 3), `api_initial_backoff_ms` (default 1000ms)
+- **Backoff**: raddoppia ogni tentativo, cap a 30 secondi
+- **Non ritentati**: errori client (4xx eccetto 429), WAF challenges (202/405)
+
+### Livello 2: Download Engine (`download_with_retry`)
+Il download di immagini ha il proprio loop di retry separato che gestisce:
+- Retry su errori di rete, timeout, 5xx, 429
+- WAF challenge detection e risoluzione
+- Circuit breaker per-dominio (5 fallimenti → cooldown 10s)
+- Streaming file e checksum
+- Cancellation token per graceful shutdown
+
+I due livelli sono complementari: il livello 1 protegge le chiamate API (ricerche, manifest),
+il livello 2 protegge i download di immagini con logica specifica.
+
 ## Concorrenza
 
-- **tokio::sync::Semaphore** - limita download paralleli (default 4)
+- **tokio::sync::Semaphore** - limita download paralleli (default 8)
 - **governor::RateLimiter** - token bucket globale (req/sec)
-- **backoff** - retry esponenziale con jitter (planned)
-- **tokio::select! + ctrl_c** - graceful shutdown (planned)
+- **Backoff esponenziale** - retry con jitter su errori transitori (due livelli)
+- **Circuit Breaker** - protezione per-dominio nel download engine
 
 ## Persistenza
 

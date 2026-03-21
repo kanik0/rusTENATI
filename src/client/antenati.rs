@@ -4,7 +4,7 @@ use reqwest::header::{self, HeaderMap, HeaderValue};
 use reqwest::Client;
 use scraper::{Html, Selector};
 use serde_json::Value;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use crate::client::iiif;
 use crate::config::HttpConfig;
@@ -24,6 +24,8 @@ pub struct AntenatiClient {
     http: Client,
     base_url: String,
     dam_url: String,
+    api_max_retries: u32,
+    api_initial_backoff_ms: u64,
 }
 
 impl AntenatiClient {
@@ -53,44 +55,128 @@ impl AntenatiClient {
             http,
             base_url: BASE_URL.to_string(),
             dam_url: DAM_URL.to_string(),
+            api_max_retries: config.api_max_retries,
+            api_initial_backoff_ms: config.api_initial_backoff_ms,
         }))
+    }
+
+    /// Parse the Retry-After header value (integer seconds) from a response.
+    fn parse_retry_after(response: &reqwest::Response) -> Option<u64> {
+        response
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+    }
+
+    /// Perform an HTTP GET with automatic retry on 5xx and 429 errors.
+    ///
+    /// Returns the successful response (2xx) or an error after retries are exhausted.
+    /// WAF-related statuses (202, 405) are returned as-is without retry.
+    async fn get_with_retry(&self, url: &str) -> Result<reqwest::Response, RustenatiError> {
+        let mut backoff_ms = self.api_initial_backoff_ms;
+        let mut last_status = None;
+        let mut last_retry_after = None;
+
+        for attempt in 1..=self.api_max_retries {
+            let response = self.http.get(url).send().await?;
+            let status = response.status();
+
+            if status.is_success() {
+                // WAF challenges come as 202 — let the caller handle them
+                return Ok(response);
+            }
+
+            // WAF-like statuses: don't retry, let caller inspect
+            if status.as_u16() == 202 || status.as_u16() == 405 {
+                return Ok(response);
+            }
+
+            let retry_after = Self::parse_retry_after(&response);
+            let status_code = status.as_u16();
+
+            // Only retry on 5xx and 429
+            let is_retryable = status.is_server_error() || status_code == 429;
+            if !is_retryable {
+                return Err(RustenatiError::UnexpectedStatus {
+                    status: status_code,
+                    url: url.to_string(),
+                });
+            }
+
+            last_status = Some(status_code);
+            last_retry_after = retry_after;
+
+            if attempt == self.api_max_retries {
+                break;
+            }
+
+            // Calculate wait time
+            let wait_ms = if let Some(ra) = retry_after {
+                // Respect Retry-After if it's larger than our backoff
+                (ra * 1000).max(backoff_ms)
+            } else if status_code == 429 {
+                // Default 429 wait: use backoff * 2
+                backoff_ms * 2
+            } else {
+                backoff_ms
+            };
+
+            // Add jitter: ±25%
+            let jitter = (wait_ms as f64 * 0.25 * (fastrand::f64() * 2.0 - 1.0)) as i64;
+            let actual_wait = (wait_ms as i64 + jitter).max(100) as u64;
+
+            warn!(
+                url = %url,
+                status = status_code,
+                attempt = attempt,
+                max_retries = self.api_max_retries,
+                wait_ms = actual_wait,
+                retry_after = ?retry_after,
+                "Server error, retrying"
+            );
+
+            tokio::time::sleep(std::time::Duration::from_millis(actual_wait)).await;
+            backoff_ms = (backoff_ms * 2).min(30_000);
+        }
+
+        // All retries exhausted
+        let status = last_status.unwrap_or(503);
+        error!(url = %url, status, attempts = self.api_max_retries, "Request failed after all retries");
+
+        if status == 429 {
+            Err(RustenatiError::RateLimited {
+                retry_after_secs: last_retry_after.unwrap_or(60),
+            })
+        } else {
+            Err(RustenatiError::ServerUnavailable {
+                status,
+                url: url.to_string(),
+                retry_after_secs: last_retry_after,
+            })
+        }
     }
 
     /// Fetch and parse an IIIF manifest from a manifest URL.
     pub async fn get_manifest(&self, manifest_url: &str) -> Result<IiifManifest, RustenatiError> {
         debug!("Fetching manifest: {manifest_url}");
 
-        let response = self.http.get(manifest_url).send().await?;
+        let response = self.get_with_retry(manifest_url).await?;
 
-        let status = response.status();
-        if !status.is_success() {
-            if status.as_u16() == 429 {
-                let retry_after = response
-                    .headers()
-                    .get("retry-after")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(60);
-                return Err(RustenatiError::RateLimited {
-                    retry_after_secs: retry_after,
+        // Check for WAF challenge (HTTP 202 or 405 with challenge body)
+        let status_code = response.status().as_u16();
+        if status_code == 202 || status_code == 405 {
+            let body = response.text().await.unwrap_or_default();
+            if body.contains("aws-waf") || body.contains("challenge") {
+                return Err(RustenatiError::WafChallenge {
+                    challenge_url: manifest_url.to_string(),
+                    body,
                 });
             }
-
-            // Check for WAF challenge (HTTP 202 or 405 with challenge body)
-            if status.as_u16() == 202 || status.as_u16() == 405 {
-                let body = response.text().await.unwrap_or_default();
-                if body.contains("aws-waf") || body.contains("challenge") {
-                    return Err(RustenatiError::WafChallenge {
-                        challenge_url: manifest_url.to_string(),
-                        body,
-                    });
-                }
-            }
-
-            return Err(RustenatiError::UnexpectedStatus {
-                status: status.as_u16(),
-                url: manifest_url.to_string(),
-            });
+            // Not a WAF challenge — try to parse as JSON anyway
+            let json: Value = serde_json::from_str(&body)
+                .map_err(|e| RustenatiError::ManifestParse(e.to_string()))?;
+            return iiif::parse_manifest(&json);
         }
 
         let json: Value = response.json().await?;
@@ -101,15 +187,7 @@ impl AntenatiClient {
     pub async fn find_manifest_url(&self, gallery_url: &str) -> Result<String, RustenatiError> {
         debug!("Fetching gallery page: {gallery_url}");
 
-        let response = self.http.get(gallery_url).send().await?;
-
-        if !response.status().is_success() {
-            return Err(RustenatiError::UnexpectedStatus {
-                status: response.status().as_u16(),
-                url: gallery_url.to_string(),
-            });
-        }
-
+        let response = self.get_with_retry(gallery_url).await?;
         let html = response.text().await?;
 
         // Look for manifest URL pattern in the HTML (Mirador viewer configuration)
@@ -173,15 +251,7 @@ impl AntenatiClient {
         let url = format!("{}/esplora-gli-archivi/", self.base_url);
         debug!("Fetching archives list: {url}");
 
-        let response = self.http.get(&url).send().await?;
-
-        if !response.status().is_success() {
-            return Err(RustenatiError::UnexpectedStatus {
-                status: response.status().as_u16(),
-                url,
-            });
-        }
-
+        let response = self.get_with_retry(&url).await?;
         let html = response.text().await?;
         Self::parse_archives_html(&html)
     }
@@ -291,15 +361,7 @@ impl AntenatiClient {
 
         debug!("Search URL: {url}");
 
-        let response = self.http.get(&url).send().await?;
-
-        if !response.status().is_success() {
-            return Err(RustenatiError::UnexpectedStatus {
-                status: response.status().as_u16(),
-                url,
-            });
-        }
-
+        let response = self.get_with_retry(&url).await?;
         let html = response.text().await?;
         Self::parse_registry_search_html(&html, params.page, params.page_size)
     }
@@ -540,15 +602,7 @@ impl AntenatiClient {
 
         debug!("Name search URL: {url}");
 
-        let response = self.http.get(&url).send().await?;
-
-        if !response.status().is_success() {
-            return Err(RustenatiError::UnexpectedStatus {
-                status: response.status().as_u16(),
-                url,
-            });
-        }
-
+        let response = self.get_with_retry(&url).await?;
         let html = response.text().await?;
         Self::parse_name_search_html(&html, page, page_size)
     }
@@ -689,14 +743,7 @@ impl AntenatiClient {
         );
 
         debug!("Suggest URL: {url}");
-        let response = self.http.get(&url).send().await?;
-
-        if !response.status().is_success() {
-            return Err(RustenatiError::UnexpectedStatus {
-                status: response.status().as_u16(),
-                url,
-            });
-        }
+        let response = self.get_with_retry(&url).await?;
 
         // The suggest endpoint returns a JSON array of strings
         let suggestions: Vec<String> = response.json().await.unwrap_or_default();

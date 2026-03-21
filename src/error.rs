@@ -38,6 +38,13 @@ pub enum RustenatiError {
     #[error("Search returned no results")]
     NoResults,
 
+    #[error("Server unavailable (HTTP {status}) for {url}")]
+    ServerUnavailable {
+        status: u16,
+        url: String,
+        retry_after_secs: Option<u64>,
+    },
+
     #[error("Unexpected HTTP status {status} for {url}")]
     UnexpectedStatus { status: u16, url: String },
 }
@@ -57,6 +64,7 @@ impl RustenatiError {
             Self::Http(_)
                 | Self::WafChallenge { .. }
                 | Self::RateLimited { .. }
+                | Self::ServerUnavailable { .. }
                 | Self::UnexpectedStatus { status: 500..=599, .. }
         )
     }
