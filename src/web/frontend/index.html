@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="it" data-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>rusTENATI</title>
+  <link rel="stylesheet" href="/vendor/pico.min.css">
+  <link rel="stylesheet" href="/app.css">
+  <script src="/vendor/htmx.min.js"></script>
+</head>
+<body>
+  <nav class="container-fluid">
+    <ul>
+      <li><strong>rusTENATI</strong></li>
+    </ul>
+    <ul>
+      <li><a href="#" onclick="navigateTo('dashboard')" class="nav-link active" data-view="dashboard">Dashboard</a></li>
+      <li><a href="#" onclick="navigateTo('browse')" class="nav-link" data-view="browse">Sfoglia</a></li>
+      <li><a href="#" onclick="navigateTo('persons')" class="nav-link" data-view="persons">Persone</a></li>
+      <li><a href="#" onclick="navigateTo('search')" class="nav-link" data-view="search">Cerca OCR</a></li>
+    </ul>
+  </nav>
+
+  <main class="container" id="content">
+    <div id="view-dashboard"></div>
+    <div id="view-browse" style="display:none"></div>
+    <div id="view-manifest" style="display:none"></div>
+    <div id="view-viewer" style="display:none"></div>
+    <div id="view-persons" style="display:none"></div>
+    <div id="view-search" style="display:none"></div>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>

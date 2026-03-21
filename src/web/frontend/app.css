@@ -1,0 +1,319 @@
+/* ─── Layout ──────────────────────────────────────────────────────────── */
+
+nav .nav-link.active {
+  font-weight: bold;
+  text-decoration: underline;
+}
+
+/* ─── Stats Cards ─────────────────────────────────────────────────────── */
+
+.stats-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 1rem;
+  margin-bottom: 2rem;
+}
+
+.stat-card {
+  text-align: center;
+  padding: 1.5rem 1rem;
+  border-radius: var(--pico-border-radius);
+  background: var(--pico-card-background-color);
+  border: 1px solid var(--pico-muted-border-color);
+}
+
+.stat-card .stat-value {
+  font-size: 2rem;
+  font-weight: bold;
+  color: var(--pico-primary);
+  display: block;
+}
+
+.stat-card .stat-label {
+  font-size: 0.85rem;
+  color: var(--pico-muted-color);
+}
+
+/* ─── Filters ─────────────────────────────────────────────────────────── */
+
+.filters {
+  display: flex;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  align-items: end;
+  margin-bottom: 1.5rem;
+}
+
+.filters label {
+  margin-bottom: 0;
+}
+
+.filters select,
+.filters input {
+  margin-bottom: 0;
+  min-width: 150px;
+}
+
+.filters .filter-group {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.filters .filter-group label {
+  font-size: 0.8rem;
+  color: var(--pico-muted-color);
+}
+
+/* ─── Tables ──────────────────────────────────────────────────────────── */
+
+.clickable-row {
+  cursor: pointer;
+}
+
+.clickable-row:hover {
+  background: var(--pico-primary-focus);
+}
+
+/* ─── Thumbnail Grid ──────────────────────────────────────────────────── */
+
+.thumb-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  gap: 0.75rem;
+  margin: 1rem 0;
+}
+
+.thumb-card {
+  cursor: pointer;
+  border: 2px solid transparent;
+  border-radius: var(--pico-border-radius);
+  overflow: hidden;
+  transition: border-color 0.15s;
+  background: var(--pico-card-background-color);
+}
+
+.thumb-card:hover {
+  border-color: var(--pico-primary);
+}
+
+.thumb-card img {
+  width: 100%;
+  height: 180px;
+  object-fit: cover;
+  display: block;
+}
+
+.thumb-card .thumb-label {
+  font-size: 0.8rem;
+  text-align: center;
+  padding: 0.35rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ─── Image Viewer ────────────────────────────────────────────────────── */
+
+.viewer-container {
+  display: grid;
+  grid-template-columns: 1fr 350px;
+  gap: 1rem;
+  height: calc(100vh - 150px);
+}
+
+.viewer-image-wrap {
+  overflow: auto;
+  position: relative;
+  background: #111;
+  border-radius: var(--pico-border-radius);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.viewer-image-wrap img {
+  max-width: none;
+  transition: transform 0.1s ease;
+  cursor: grab;
+}
+
+.viewer-image-wrap img:active {
+  cursor: grabbing;
+}
+
+.viewer-sidebar {
+  overflow-y: auto;
+  padding: 1rem;
+  background: var(--pico-card-background-color);
+  border-radius: var(--pico-border-radius);
+  border: 1px solid var(--pico-muted-border-color);
+}
+
+.viewer-controls {
+  display: flex;
+  gap: 0.5rem;
+  margin-bottom: 1rem;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.viewer-nav {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.viewer-zoom {
+  display: flex;
+  gap: 0.25rem;
+  align-items: center;
+}
+
+.viewer-zoom button {
+  padding: 0.25rem 0.5rem;
+  margin: 0;
+  width: auto;
+}
+
+/* ─── OCR Text ────────────────────────────────────────────────────────── */
+
+.ocr-text {
+  white-space: pre-wrap;
+  font-family: var(--pico-font-family-monospace, monospace);
+  font-size: 0.85rem;
+  background: var(--pico-code-background-color);
+  padding: 1rem;
+  border-radius: var(--pico-border-radius);
+  max-height: 400px;
+  overflow-y: auto;
+}
+
+/* ─── Tags ────────────────────────────────────────────────────────────── */
+
+.tag-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+
+.tag {
+  display: inline-block;
+  font-size: 0.75rem;
+  padding: 0.15rem 0.5rem;
+  border-radius: 999px;
+  background: var(--pico-primary-focus);
+  color: var(--pico-primary);
+}
+
+/* ─── Metadata Table ──────────────────────────────────────────────────── */
+
+.metadata-table {
+  font-size: 0.9rem;
+}
+
+.metadata-table th {
+  width: 200px;
+  white-space: nowrap;
+}
+
+/* ─── Pagination ──────────────────────────────────────────────────────── */
+
+.pagination {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  justify-content: center;
+  margin: 1.5rem 0;
+}
+
+.pagination button {
+  width: auto;
+  padding: 0.25rem 0.75rem;
+  margin: 0;
+}
+
+.pagination .page-info {
+  font-size: 0.85rem;
+  color: var(--pico-muted-color);
+}
+
+/* ─── Search Results ──────────────────────────────────────────────────── */
+
+.search-result {
+  padding: 1rem;
+  border: 1px solid var(--pico-muted-border-color);
+  border-radius: var(--pico-border-radius);
+  margin-bottom: 0.75rem;
+  cursor: pointer;
+  transition: border-color 0.15s;
+}
+
+.search-result:hover {
+  border-color: var(--pico-primary);
+}
+
+.search-result .result-title {
+  font-weight: bold;
+  margin-bottom: 0.25rem;
+}
+
+.search-result .result-meta {
+  font-size: 0.8rem;
+  color: var(--pico-muted-color);
+  margin-bottom: 0.5rem;
+}
+
+.search-result .result-snippet {
+  font-size: 0.9rem;
+  font-family: var(--pico-font-family-monospace, monospace);
+}
+
+/* ─── Loading ─────────────────────────────────────────────────────────── */
+
+.loading {
+  text-align: center;
+  padding: 2rem;
+  color: var(--pico-muted-color);
+}
+
+.empty-state {
+  text-align: center;
+  padding: 3rem 1rem;
+  color: var(--pico-muted-color);
+}
+
+/* ─── Manifest Header ────────────────────────────────────────────────── */
+
+.manifest-header {
+  margin-bottom: 1.5rem;
+}
+
+.manifest-header h2 {
+  margin-bottom: 0.5rem;
+}
+
+.manifest-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  font-size: 0.9rem;
+  color: var(--pico-muted-color);
+}
+
+/* ─── Responsive ──────────────────────────────────────────────────────── */
+
+@media (max-width: 768px) {
+  .viewer-container {
+    grid-template-columns: 1fr;
+    height: auto;
+  }
+
+  .filters {
+    flex-direction: column;
+  }
+
+  .filters select,
+  .filters input {
+    min-width: 100%;
+  }
+}

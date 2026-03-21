@@ -1,10 +1,9 @@
-use std::path::PathBuf;
-
 use anyhow::Result;
 use clap::{Args, Subcommand};
 use comfy_table::{presets::UTF8_FULL_CONDENSED, Table};
 
 use crate::download::state::StateDb;
+use crate::output;
 
 #[derive(Debug, Subcommand)]
 pub enum QueryAction {
@@ -41,10 +40,6 @@ pub struct RegistriesQueryArgs {
     /// Filter by archive name (substring match)
     #[arg(long)]
     pub archive: Option<String>,
-
-    /// Database path
-    #[arg(long, default_value = "./antenati/rustenati.db")]
-    pub db: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -60,10 +55,6 @@ pub struct PersonsQueryArgs {
     /// Show linked records for each person
     #[arg(long)]
     pub records: bool,
-
-    /// Database path
-    #[arg(long, default_value = "./antenati/rustenati.db")]
-    pub db: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -74,10 +65,6 @@ pub struct OcrQueryArgs {
     /// Max results
     #[arg(long, default_value = "20")]
     pub limit: usize,
-
-    /// Database path
-    #[arg(long, default_value = "./antenati/rustenati.db")]
-    pub db: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -97,18 +84,10 @@ pub struct ManifestsQueryArgs {
     /// Filter by locality (substring match on archival context)
     #[arg(long)]
     pub locality: Option<String>,
-
-    /// Database path
-    #[arg(long, default_value = "./antenati/rustenati.db")]
-    pub db: PathBuf,
 }
 
 #[derive(Debug, Args)]
-pub struct StatsQueryArgs {
-    /// Database path
-    #[arg(long, default_value = "./antenati/rustenati.db")]
-    pub db: PathBuf,
-}
+pub struct StatsQueryArgs {}
 
 pub fn run(action: &QueryAction, json_output: bool) -> Result<()> {
     match action {
@@ -121,7 +100,7 @@ pub fn run(action: &QueryAction, json_output: bool) -> Result<()> {
 }
 
 fn run_query_registries(args: &RegistriesQueryArgs, json_output: bool) -> Result<()> {
-    let db = StateDb::open(&args.db)?;
+    let db = StateDb::open(&output::db_path())?;
     let results = db.search_registry_results(
         args.doc_type.as_deref(),
         args.year.as_deref(),
@@ -167,7 +146,7 @@ fn run_query_registries(args: &RegistriesQueryArgs, json_output: bool) -> Result
 }
 
 fn run_query_persons(args: &PersonsQueryArgs, json_output: bool) -> Result<()> {
-    let db = StateDb::open(&args.db)?;
+    let db = StateDb::open(&output::db_path())?;
     let persons = db.search_persons(args.surname.as_deref(), args.name.as_deref())?;
 
     if json_output {
@@ -224,7 +203,7 @@ fn run_query_persons(args: &PersonsQueryArgs, json_output: bool) -> Result<()> {
 }
 
 fn run_query_ocr(args: &OcrQueryArgs, json_output: bool) -> Result<()> {
-    let db = StateDb::open(&args.db)?;
+    let db = StateDb::open(&output::db_path())?;
     let results = db.search_ocr_text(&args.query, args.limit)?;
 
     if json_output {
@@ -255,7 +234,7 @@ fn run_query_ocr(args: &OcrQueryArgs, json_output: bool) -> Result<()> {
 }
 
 fn run_query_manifests(args: &ManifestsQueryArgs, json_output: bool) -> Result<()> {
-    let db = StateDb::open(&args.db)?;
+    let db = StateDb::open(&output::db_path())?;
     let results = db.search_manifests(
         args.doc_type.as_deref(),
         args.year.as_deref(),
@@ -293,8 +272,8 @@ fn run_query_manifests(args: &ManifestsQueryArgs, json_output: bool) -> Result<(
     Ok(())
 }
 
-fn run_query_stats(args: &StatsQueryArgs, json_output: bool) -> Result<()> {
-    let db = StateDb::open(&args.db)?;
+fn run_query_stats(_args: &StatsQueryArgs, json_output: bool) -> Result<()> {
+    let db = StateDb::open(&output::db_path())?;
     let stats = db.get_extended_stats()?;
 
     if json_output {

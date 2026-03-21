@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -15,10 +14,6 @@ use crate::output;
 pub struct DownloadArgs {
     /// Manifest URL, archive ID, ARK identifier, or "search:" prefix for batch
     pub source: Option<String>,
-
-    /// Output directory
-    #[arg(short, long, default_value = "./antenati")]
-    pub output: PathBuf,
 
     /// Parallel downloads
     #[arg(short, long, default_value = "4")]
@@ -144,9 +139,9 @@ async fn run_single_download(
 ) -> Result<()> {
     let manifest_url = client.resolve_manifest_url(source).await?;
     let manifest = client.get_manifest(&manifest_url).await?;
-    let output_dir = output::build_output_dir(&args.output, &manifest);
+    let output_dir = output::build_output_dir(&output::base_dir(), &manifest);
 
-    let state_db_path = args.output.join("rustenati.db");
+    let state_db_path = output::db_path();
     let state_db = StateDb::open(&state_db_path)?;
 
     let limiter = rate_limiter::create_rate_limiter(effective_rps(args));
@@ -279,7 +274,7 @@ async fn run_batch_download(
         return Ok(());
     }
 
-    let state_db_path = args.output.join("rustenati.db");
+    let state_db_path = output::db_path();
     let state_db = StateDb::open(&state_db_path)?;
 
     let limiter = rate_limiter::create_rate_limiter(effective_rps(args));
@@ -338,7 +333,7 @@ async fn run_batch_download(
             }
         };
 
-        let output_dir = output::build_output_dir(&args.output, &manifest);
+        let output_dir = output::build_output_dir(&output::base_dir(), &manifest);
 
         let summary = match engine::download_manifest(
             client.clone(),
@@ -385,12 +380,12 @@ async fn run_batch_download(
                 "images_skipped": total_summary.skipped,
                 "images_failed": total_summary.failed,
                 "failed_arks": failed_registries,
-                "output_dir": args.output.display().to_string(),
+                "output_dir": output::base_dir().display().to_string(),
             })
         );
     } else {
         println!("Images: {total_summary}");
-        println!("Output: {}", args.output.display());
+        println!("Output: {}", output::base_dir().display());
         if !failed_registries.is_empty() {
             eprintln!("\nFailed registries:");
             for ark in &failed_registries {
@@ -433,7 +428,7 @@ async fn run_noah_mode(
         return Ok(());
     }
 
-    let state_db_path = args.output.join("rustenati.db");
+    let state_db_path = output::db_path();
     let state_db = StateDb::open(&state_db_path)?;
     let limiter = rate_limiter::create_rate_limiter(effective_rps(args));
 
@@ -559,7 +554,7 @@ async fn run_noah_mode(
                 }
             };
 
-            let output_dir = output::build_output_dir(&args.output, &manifest);
+            let output_dir = output::build_output_dir(&output::base_dir(), &manifest);
 
             let summary = match engine::download_manifest(
                 client.clone(),
@@ -621,12 +616,12 @@ async fn run_noah_mode(
                 "images_skipped": grand_total.skipped,
                 "images_failed": grand_total.failed,
                 "failed_archives": failed_archives,
-                "output_dir": args.output.display().to_string(),
+                "output_dir": output::base_dir().display().to_string(),
             })
         );
     } else {
         println!("Images: {grand_total}");
-        println!("Output: {}", args.output.display());
+        println!("Output: {}", output::base_dir().display());
         if !failed_archives.is_empty() {
             eprintln!("\nFailed archives:");
             for name in &failed_archives {
@@ -638,7 +633,7 @@ async fn run_noah_mode(
     Ok(())
 }
 
-fn print_summary(summary: &DownloadSummary, output_dir: &PathBuf, json_output: bool) {
+fn print_summary(summary: &DownloadSummary, output_dir: &std::path::Path, json_output: bool) {
     if json_output {
         println!(
             "{}",

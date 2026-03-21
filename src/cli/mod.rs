@@ -81,6 +81,9 @@ pub enum Command {
         #[command(subcommand)]
         action: commands::query::QueryAction,
     },
+
+    /// Start a local web server to browse downloaded documents
+    Serve(commands::serve::ServeArgs),
 }
 
 #[derive(Debug, Subcommand)]

@@ -5,5 +5,6 @@ pub mod info;
 pub mod ocr;
 pub mod query;
 pub mod search;
+pub mod serve;
 pub mod status;
 pub mod tags;

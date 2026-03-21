@@ -4,6 +4,22 @@ use anyhow::{Context, Result};
 
 use crate::models::manifest::IiifManifest;
 
+/// Fixed base output directory for all downloads.
+pub const BASE_DIR: &str = "./antenati";
+
+/// Fixed path to the SQLite state database.
+pub const DB_PATH: &str = "./antenati/rustenati.db";
+
+/// Return the base output directory as a PathBuf.
+pub fn base_dir() -> PathBuf {
+    PathBuf::from(BASE_DIR)
+}
+
+/// Return the database path as a PathBuf.
+pub fn db_path() -> PathBuf {
+    PathBuf::from(DB_PATH)
+}
+
 /// Sanitize a string for use as a filesystem name.
 fn sanitize_filename(name: &str) -> String {
     name.chars()

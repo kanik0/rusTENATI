@@ -1281,6 +1281,245 @@ impl StateDb {
             ocr_results: ocr_results as usize,
         })
     }
+
+    // ─── Web API Methods ─────────────────────────────────────────────────
+
+    /// Get a single manifest by ID.
+    pub fn get_manifest_by_id(&self, id: &str) -> Result<Option<ManifestRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT m.id, m.archive_id, m.title, m.total_canvases, m.doc_type,
+                    m.archival_context, m.signature, m.date_from, m.date_to,
+                    m.iiif_version, m.year, m.ark_url,
+                    a.name as archive_name
+             FROM manifests m
+             LEFT JOIN archives a ON m.archive_db_id = a.id
+             WHERE m.id = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![id], |row| {
+            Ok(ManifestRecord {
+                id: row.get(0)?,
+                archive_id: row.get(1)?,
+                title: row.get(2)?,
+                total_canvases: row.get::<_, Option<i64>>(3)?.map(|v| v as usize),
+                doc_type: row.get(4)?,
+                archival_context: row.get(5)?,
+                signature: row.get(6)?,
+                date_from: row.get(7)?,
+                date_to: row.get(8)?,
+                iiif_version: row.get(9)?,
+                year: row.get(10)?,
+                ark_url: row.get(11)?,
+                archive_name: row.get(12)?,
+            })
+        })?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Get all downloads for a manifest (all statuses), with full metadata.
+    pub fn get_all_downloads_for_manifest(&self, manifest_id: &str) -> Result<Vec<FullDownloadRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, manifest_id, canvas_id, canvas_index, canvas_label,
+                    image_url, local_path, status, ocr_status, width, height
+             FROM downloads WHERE manifest_id = ?1
+             ORDER BY canvas_index",
+        )?;
+        let records = stmt
+            .query_map(params![manifest_id], |row| {
+                Ok(FullDownloadRecord {
+                    id: row.get(0)?,
+                    manifest_id: row.get(1)?,
+                    canvas_id: row.get(2)?,
+                    canvas_index: row.get::<_, i64>(3)? as usize,
+                    canvas_label: row.get(4)?,
+                    image_url: row.get(5)?,
+                    local_path: row.get(6)?,
+                    status: row.get(7)?,
+                    ocr_status: row.get(8)?,
+                    width: row.get::<_, Option<i64>>(9)?.map(|v| v as u32),
+                    height: row.get::<_, Option<i64>>(10)?.map(|v| v as u32),
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(records)
+    }
+
+    /// Get OCR results for a specific download.
+    pub fn get_ocr_for_download(&self, download_id: i64) -> Result<Vec<OcrRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, backend, raw_text, structured_json, processed_at
+             FROM ocr_results WHERE download_id = ?1",
+        )?;
+        let records = stmt
+            .query_map(params![download_id], |row| {
+                Ok(OcrRecord {
+                    id: row.get(0)?,
+                    backend: row.get(1)?,
+                    raw_text: row.get(2)?,
+                    structured_json: row.get(3)?,
+                    processed_at: row.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(records)
+    }
+
+    /// Search manifests with pagination. Returns (results, total_count).
+    pub fn search_manifests_paginated(
+        &self,
+        doc_type: Option<&str>,
+        year: Option<&str>,
+        archive_name: Option<&str>,
+        locality: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<(Vec<ManifestRecord>, usize)> {
+        let mut where_clause = "WHERE 1=1".to_string();
+        let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+        if let Some(dt) = doc_type {
+            where_clause.push_str(&format!(" AND m.doc_type = ?{}", params_vec.len() + 1));
+            params_vec.push(Box::new(dt.to_string()));
+        }
+        if let Some(y) = year {
+            where_clause.push_str(&format!(" AND m.year LIKE ?{}", params_vec.len() + 1));
+            params_vec.push(Box::new(format!("%{y}%")));
+        }
+        if let Some(an) = archive_name {
+            where_clause.push_str(&format!(" AND a.name LIKE ?{}", params_vec.len() + 1));
+            params_vec.push(Box::new(format!("%{an}%")));
+        }
+        if let Some(loc) = locality {
+            where_clause.push_str(&format!(" AND m.archival_context LIKE ?{}", params_vec.len() + 1));
+            params_vec.push(Box::new(format!("%{loc}%")));
+        }
+
+        // Count query
+        let count_sql = format!(
+            "SELECT COUNT(*) FROM manifests m LEFT JOIN archives a ON m.archive_db_id = a.id {where_clause}"
+        );
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+        let total: i64 = self.conn.query_row(&count_sql, params_refs.as_slice(), |row| row.get(0))?;
+
+        // Data query with pagination
+        let data_sql = format!(
+            "SELECT m.id, m.archive_id, m.title, m.total_canvases, m.doc_type,
+                    m.archival_context, m.signature, m.date_from, m.date_to,
+                    m.iiif_version, m.year, m.ark_url,
+                    a.name as archive_name
+             FROM manifests m
+             LEFT JOIN archives a ON m.archive_db_id = a.id
+             {where_clause}
+             ORDER BY m.year, m.doc_type
+             LIMIT ?{} OFFSET ?{}",
+            params_vec.len() + 1,
+            params_vec.len() + 2,
+        );
+        params_vec.push(Box::new(limit as i64));
+        params_vec.push(Box::new(offset as i64));
+
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+        let mut stmt = self.conn.prepare(&data_sql)?;
+        let records = stmt
+            .query_map(params_refs.as_slice(), |row| {
+                Ok(ManifestRecord {
+                    id: row.get(0)?,
+                    archive_id: row.get(1)?,
+                    title: row.get(2)?,
+                    total_canvases: row.get::<_, Option<i64>>(3)?.map(|v| v as usize),
+                    doc_type: row.get(4)?,
+                    archival_context: row.get(5)?,
+                    signature: row.get(6)?,
+                    date_from: row.get(7)?,
+                    date_to: row.get(8)?,
+                    iiif_version: row.get(9)?,
+                    year: row.get(10)?,
+                    ark_url: row.get(11)?,
+                    archive_name: row.get(12)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok((records, total as usize))
+    }
+
+    /// Get distinct document types.
+    pub fn get_distinct_doc_types(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT doc_type FROM manifests WHERE doc_type IS NOT NULL ORDER BY doc_type",
+        )?;
+        let records = stmt
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(records)
+    }
+
+    /// Get distinct years.
+    pub fn get_distinct_years(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT year FROM manifests WHERE year IS NOT NULL ORDER BY year",
+        )?;
+        let records = stmt
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(records)
+    }
+
+    /// Search persons with pagination. Returns (results, total_count).
+    pub fn search_persons_paginated(
+        &self,
+        surname: Option<&str>,
+        given_name: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<(Vec<PersonRecord>, usize)> {
+        let mut where_clause = "WHERE 1=1".to_string();
+        let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+        if let Some(s) = surname {
+            where_clause.push_str(&format!(" AND surname LIKE ?{}", params_vec.len() + 1));
+            params_vec.push(Box::new(format!("%{s}%")));
+        }
+        if let Some(n) = given_name {
+            where_clause.push_str(&format!(" AND given_name LIKE ?{}", params_vec.len() + 1));
+            params_vec.push(Box::new(format!("%{n}%")));
+        }
+
+        let count_sql = format!("SELECT COUNT(*) FROM persons {where_clause}");
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+        let total: i64 = self.conn.query_row(&count_sql, params_refs.as_slice(), |row| row.get(0))?;
+
+        let data_sql = format!(
+            "SELECT id, name, surname, given_name, detail_url, birth_info, death_info
+             FROM persons {where_clause}
+             ORDER BY surname, given_name
+             LIMIT ?{} OFFSET ?{}",
+            params_vec.len() + 1,
+            params_vec.len() + 2,
+        );
+        params_vec.push(Box::new(limit as i64));
+        params_vec.push(Box::new(offset as i64));
+
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+        let mut stmt = self.conn.prepare(&data_sql)?;
+        let records = stmt
+            .query_map(params_refs.as_slice(), |row| {
+                Ok(PersonRecord {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    surname: row.get(2)?,
+                    given_name: row.get(3)?,
+                    detail_url: row.get(4)?,
+                    birth_info: row.get(5)?,
+                    death_info: row.get(6)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok((records, total as usize))
+    }
 }
 
 // ─── Data Structures ────────────────────────────────────────────────────
@@ -1315,7 +1554,23 @@ pub struct DownloadRecord {
     pub status: String,
 }
 
-#[derive(Debug, Clone)]
+/// Full download record with all fields for web API.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FullDownloadRecord {
+    pub id: i64,
+    pub manifest_id: String,
+    pub canvas_id: String,
+    pub canvas_index: usize,
+    pub canvas_label: Option<String>,
+    pub image_url: String,
+    pub local_path: Option<String>,
+    pub status: String,
+    pub ocr_status: String,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct DownloadStats {
     pub total: usize,
     pub complete: usize,
@@ -1439,6 +1694,15 @@ pub struct PersonRecordEntry {
     pub date: Option<String>,
     pub ark_url: Option<String>,
     pub manifest_id: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct OcrRecord {
+    pub id: i64,
+    pub backend: String,
+    pub raw_text: Option<String>,
+    pub structured_json: Option<String>,
+    pub processed_at: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]

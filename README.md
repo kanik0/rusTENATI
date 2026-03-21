@@ -7,6 +7,7 @@ High-performance Rust CLI for downloading genealogical records from [Portale Ant
 - **Search** by person name or registry (locality, year, document type) with paginated results
 - **Download** IIIF images with parallel downloads, rate limiting, retry with exponential backoff, and resume support
 - **Batch download** entire search results in a single command
+- **Web interface** — local web server to browse, filter, and view all downloaded documents
 - **OCR** handwritten historical documents with 4 pluggable backends (Claude Vision, Transkribus, Azure Document Intelligence, Google Cloud Vision)
 - **Tag extraction** — automatically extract surnames, names, dates, locations, roles from OCR results
 - **SQLite state tracking** for download resume, session history, and local tag search
@@ -32,13 +33,13 @@ rustenati info <MANIFEST_URL> --full    # show all canvases
 
 # Download specific pages
 rustenati download <MANIFEST_URL> --pages 1-10 --dry-run   # preview
-rustenati download <MANIFEST_URL> --pages 1-10 -o ./output  # download
+rustenati download <MANIFEST_URL> --pages 1-10              # download
 
 # Download all images from a manifest
-rustenati download <MANIFEST_URL> -o ./output -j 4 --delay 500
+rustenati download <MANIFEST_URL> -j 4 --delay 500
 
 # Resume an interrupted download
-rustenati download <MANIFEST_URL> -o ./output --resume
+rustenati download <MANIFEST_URL> --resume
 
 # Batch download: search + download all matching registries
 rustenati download --search --locality Napoli --year-from 1807 --doc-type Nati --max-registries 50
@@ -228,19 +229,46 @@ The `download` and `info` commands accept multiple source formats:
 
 ## Output Structure
 
+All data is saved in the `./antenati` directory (fixed, not configurable). This includes downloaded images, OCR results, and the SQLite database that tracks all state.
+
 ```
-output/{archive}/{register}/
-├── manifest.json       # IIIF manifest
-├── metadata.json       # Download metadata (date, version, etc.)
-├── images/
-│   ├── 001_pag. 1.jpg
-│   ├── 002_pag. 2.jpg
-│   └── ...
-└── ocr/
-    ├── 001_pag. 1.txt  # Plain text transcription
-    ├── 001_pag. 1.json # Structured tags (when --extract-tags)
-    └── ...
+antenati/
+├── rustenati.db            # SQLite state database
+├── {archive}/{register}/
+│   ├── manifest.json       # IIIF manifest
+│   ├── metadata.json       # Download metadata (date, version, etc.)
+│   ├── images/
+│   │   ├── 001_pag. 1.jpg
+│   │   ├── 002_pag. 2.jpg
+│   │   └── ...
+│   └── ocr/
+│       ├── 001_pag. 1.txt  # Plain text transcription
+│       ├── 001_pag. 1.json # Structured tags (when --extract-tags)
+│       └── ...
+└── ...
 ```
+
+## Web Interface
+
+Browse all downloaded documents locally with a built-in web interface:
+
+```bash
+# Start the web server
+rustenati serve
+
+# Open browser automatically
+rustenati serve --open
+
+# Custom port
+rustenati serve --port 3000
+```
+
+The web interface provides:
+- **Dashboard** with download statistics
+- **Browse** registries with filters (document type, year, archive, locality)
+- **Image viewer** with zoom/pan and keyboard navigation
+- **Person search** with linked records
+- **Full-text OCR search** across all transcriptions
 
 ## Documentation
 

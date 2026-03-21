@@ -6,7 +6,7 @@ Cargo.lock
 config.toml
 
 # Output directory (downloaded images/data)
-output/
+antenati/
 
 # SQLite databases
 *.db

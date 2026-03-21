@@ -15,7 +15,6 @@ pub struct Config {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DownloadConfig {
-    pub output_dir: PathBuf,
     pub concurrency: usize,
     pub delay_ms: u64,
     pub quality: String,
@@ -101,7 +100,6 @@ impl Default for Config {
 impl Default for DownloadConfig {
     fn default() -> Self {
         Self {
-            output_dir: PathBuf::from("./antenati"),
             concurrency: 4,
             delay_ms: 500,
             quality: "full".into(),
