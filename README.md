@@ -55,6 +55,9 @@ rustenati search registry --archive archivio-di-stato-di-lucca --doc-type Nati -
 rustenati download --search --archive archivio-di-stato-di-lucca --max-registries 5000
 rustenati download --search --archive archivio-di-stato-di-lucca --doc-type Nati --dry-run
 
+# Filter batch results by locality name (case-insensitive)
+rustenati download --search --archive archivio-di-stato-di-massa --doc-type Nati --dry-run --filter massa --all
+
 # NOAH MODE: dump the ENTIRE portal (all archives, all registries)
 rustenati download --noah --dry-run                   # preview what would be downloaded
 rustenati download --noah --resume -j 8 --rps 5       # aggressive download with resume

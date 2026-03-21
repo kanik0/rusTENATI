@@ -73,6 +73,10 @@ pub struct DownloadArgs {
     #[arg(long)]
     pub doc_type: Option<String>,
 
+    /// Filter results by locality name (case-insensitive substring match)
+    #[arg(long)]
+    pub filter: Option<String>,
+
     /// Max registries to download in batch mode
     #[arg(long, default_value = "100")]
     pub max_registries: usize,
@@ -248,6 +252,15 @@ async fn run_batch_download(
     if !args.all {
         all_results.truncate(args.max_registries);
     }
+
+    if let Some(filter) = &args.filter {
+        let filter_lower = filter.to_lowercase();
+        all_results.retain(|r| {
+            let loc = r.context.rsplit(" > ").next().unwrap_or(&r.context).trim();
+            loc.to_lowercase().contains(&filter_lower)
+        });
+    }
+
     let total_registries = all_results.len();
     eprintln!("Found {total_registries} registries to download.");
 
