@@ -144,6 +144,14 @@ async fn run_single_download(
     let state_db_path = output::db_path();
     let state_db = StateDb::open(&state_db_path)?;
 
+    // Populate registry catalog from manifest metadata
+    let ark_url = if source.contains("ark:") {
+        Some(source)
+    } else {
+        None
+    };
+    state_db.upsert_registry_from_manifest(&manifest, ark_url)?;
+
     let limiter = rate_limiter::create_rate_limiter(effective_rps(args));
 
     let page_range = args
@@ -169,6 +177,7 @@ async fn run_single_download(
         &manifest,
         &output_dir,
         &config,
+        ark_url.map(|s| s as &str),
     )
     .await?;
 
@@ -265,6 +274,11 @@ async fn run_batch_download(
         return Ok(());
     }
 
+    // Persist found registries to catalog
+    let state_db_path = output::db_path();
+    let state_db = StateDb::open(&state_db_path)?;
+    state_db.upsert_registries_batch(&all_results)?;
+
     // Dry run: just list
     if args.dry_run {
         println!("Dry run: would download {} registries:", total_registries);
@@ -274,9 +288,6 @@ async fn run_batch_download(
         }
         return Ok(());
     }
-
-    let state_db_path = output::db_path();
-    let state_db = StateDb::open(&state_db_path)?;
 
     let limiter = rate_limiter::create_rate_limiter(effective_rps(args));
 
@@ -343,6 +354,7 @@ async fn run_batch_download(
             &manifest,
             &output_dir,
             &config,
+            Some(&result.ark_url),
         )
         .await
         {
@@ -518,6 +530,9 @@ async fn run_noah_mode(
             continue;
         }
 
+        // Persist found registries to catalog
+        state_db.upsert_registries_batch(&all_results)?;
+
         let archive_registries = all_results.len();
 
         // Download each registry
@@ -564,6 +579,7 @@ async fn run_noah_mode(
                 &manifest,
                 &output_dir,
                 &config,
+                Some(&result.ark_url),
             )
             .await
             {

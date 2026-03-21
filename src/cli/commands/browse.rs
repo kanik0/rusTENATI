@@ -5,6 +5,8 @@ use clap::{Args, Subcommand};
 use comfy_table::{presets::UTF8_FULL_CONDENSED, Table};
 
 use crate::client::antenati::AntenatiClient;
+use crate::download::state::StateDb;
+use crate::output;
 
 #[derive(Debug, Subcommand)]
 pub enum BrowseAction {
@@ -35,6 +37,12 @@ async fn run_list_archives(
     client: Arc<AntenatiClient>,
 ) -> Result<()> {
     let archives = client.list_archives().await?;
+
+    // Persist all archives to database
+    let state_db = StateDb::open(&output::db_path())?;
+    for a in &archives {
+        state_db.upsert_archive(&a.name, &a.slug, Some(&a.url))?;
+    }
 
     let filtered: Vec<_> = if let Some(filter) = &args.filter {
         let filter_lower = filter.to_lowercase();

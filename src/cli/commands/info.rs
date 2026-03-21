@@ -32,6 +32,11 @@ pub async fn run(
         if let Err(e) = db.store_manifest_from_iiif(&manifest, Some(&args.source)) {
             tracing::warn!("Failed to cache manifest metadata: {e}");
         }
+        // Also populate registry catalog
+        let ark_url = if args.source.contains("ark:") { Some(args.source.as_str()) } else { None };
+        if let Err(e) = db.upsert_registry_from_manifest(&manifest, ark_url) {
+            tracing::warn!("Failed to cache registry entry: {e}");
+        }
     }
 
     if json_output {
