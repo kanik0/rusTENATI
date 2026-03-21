@@ -80,19 +80,30 @@ struct PaginatedResponse<T: Serialize> {
     per_page: usize,
 }
 
+// ─── Helper macro for pool access ────────────────────────────────────────
+
+macro_rules! with_db {
+    ($state:expr) => {
+        match $state.pool.get().await {
+            Ok(guard) => guard,
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        }
+    };
+}
+
 // ─── Handlers ────────────────────────────────────────────────────────────
 
 async fn get_stats(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let db = state.db.lock().unwrap();
-    match db.get_extended_stats() {
+    let guard = with_db!(state);
+    match guard.db().get_extended_stats() {
         Ok(stats) => Json(stats).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 
 async fn get_archives(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let db = state.db.lock().unwrap();
-    match db.list_archives() {
+    let guard = with_db!(state);
+    match guard.db().list_archives() {
         Ok(archives) => Json(archives).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -102,9 +113,9 @@ async fn get_localities(
     State(state): State<Arc<AppState>>,
     Query(params): Query<LocalityQuery>,
 ) -> impl IntoResponse {
-    let db = state.db.lock().unwrap();
+    let guard = with_db!(state);
     let pattern = params.q.as_deref().unwrap_or("");
-    match db.search_localities(pattern) {
+    match guard.db().search_localities(pattern) {
         Ok(localities) => Json(localities).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -114,12 +125,12 @@ async fn get_manifests(
     State(state): State<Arc<AppState>>,
     Query(params): Query<ManifestQuery>,
 ) -> impl IntoResponse {
-    let db = state.db.lock().unwrap();
+    let guard = with_db!(state);
     let page = params.page.unwrap_or(1).max(1);
     let per_page = params.per_page.unwrap_or(50).min(200);
     let offset = (page - 1) * per_page;
 
-    match db.search_manifests_paginated(
+    match guard.db().search_manifests_paginated(
         params.doc_type.as_deref(),
         params.year.as_deref(),
         params.archive.as_deref(),
@@ -142,8 +153,8 @@ async fn get_manifest(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let db = state.db.lock().unwrap();
-    match db.get_manifest_by_id(&id) {
+    let guard = with_db!(state);
+    match guard.db().get_manifest_by_id(&id) {
         Ok(Some(manifest)) => Json(manifest).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -154,8 +165,8 @@ async fn get_manifest_pages(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let db = state.db.lock().unwrap();
-    match db.get_all_downloads_for_manifest(&id) {
+    let guard = with_db!(state);
+    match guard.db().get_all_downloads_for_manifest(&id) {
         Ok(pages) => Json(pages).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -165,8 +176,8 @@ async fn get_manifest_metadata(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let db = state.db.lock().unwrap();
-    match db.get_manifest_metadata(&id) {
+    let guard = with_db!(state);
+    match guard.db().get_manifest_metadata(&id) {
         Ok(metadata) => Json(metadata).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -176,12 +187,12 @@ async fn get_persons(
     State(state): State<Arc<AppState>>,
     Query(params): Query<PersonQuery>,
 ) -> impl IntoResponse {
-    let db = state.db.lock().unwrap();
+    let guard = with_db!(state);
     let page = params.page.unwrap_or(1).max(1);
     let per_page = params.per_page.unwrap_or(50).min(200);
     let offset = (page - 1) * per_page;
 
-    match db.search_persons_paginated(
+    match guard.db().search_persons_paginated(
         params.surname.as_deref(),
         params.name.as_deref(),
         offset,
@@ -202,8 +213,8 @@ async fn get_person(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    let db = state.db.lock().unwrap();
-    match db.get_person_records(id) {
+    let guard = with_db!(state);
+    match guard.db().get_person_records(id) {
         Ok(records) => Json(records).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -213,25 +224,25 @@ async fn search_ocr(
     State(state): State<Arc<AppState>>,
     Query(params): Query<OcrQuery>,
 ) -> impl IntoResponse {
-    let db = state.db.lock().unwrap();
+    let guard = with_db!(state);
     let limit = params.limit.unwrap_or(50).min(200);
-    match db.search_ocr_text(&params.q, limit) {
+    match guard.db().search_ocr_text(&params.q, limit) {
         Ok(results) => Json(results).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 
 async fn get_facet_doc_types(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let db = state.db.lock().unwrap();
-    match db.get_distinct_doc_types() {
+    let guard = with_db!(state);
+    match guard.db().get_distinct_doc_types() {
         Ok(types) => Json(types).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 
 async fn get_facet_years(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let db = state.db.lock().unwrap();
-    match db.get_distinct_years() {
+    let guard = with_db!(state);
+    match guard.db().get_distinct_years() {
         Ok(years) => Json(years).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -241,8 +252,8 @@ async fn get_download_ocr(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    let db = state.db.lock().unwrap();
-    match db.get_ocr_for_download(id) {
+    let guard = with_db!(state);
+    match guard.db().get_ocr_for_download(id) {
         Ok(results) => Json(results).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -252,8 +263,8 @@ async fn get_download_tags(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    let db = state.db.lock().unwrap();
-    match db.get_tags_for_download(id) {
+    let guard = with_db!(state);
+    match guard.db().get_tags_for_download(id) {
         Ok(tags) => Json(tags).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -263,12 +274,12 @@ async fn get_registries(
     State(state): State<Arc<AppState>>,
     Query(params): Query<RegistryQuery>,
 ) -> impl IntoResponse {
-    let db = state.db.lock().unwrap();
+    let guard = with_db!(state);
     let page = params.page.unwrap_or(1).max(1);
     let per_page = params.per_page.unwrap_or(50).min(200);
     let offset = (page - 1) * per_page;
 
-    match db.search_registries_catalog(
+    match guard.db().search_registries_catalog(
         params.doc_type.as_deref(),
         params.year.as_deref(),
         params.archive.as_deref(),
@@ -283,8 +294,8 @@ async fn get_registries(
 }
 
 async fn get_registry_facets(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let db = state.db.lock().unwrap();
-    match db.get_registry_facets() {
+    let guard = with_db!(state);
+    match guard.db().get_registry_facets() {
         Ok(facets) => Json(facets).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }

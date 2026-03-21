@@ -47,6 +47,8 @@ impl AntenatiClient {
 
         let http = builder.build()?;
 
+        debug!("HTTP client configured (rustls-tls, HTTP/2 ALPN enabled)");
+
         Ok(Arc::new(Self {
             http,
             base_url: BASE_URL.to_string(),

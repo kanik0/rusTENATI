@@ -51,6 +51,8 @@ impl StateDb {
         let conn = Connection::open(path)
             .with_context(|| format!("Failed to open state database: {}", path.display()))?;
 
+        Self::apply_pragmas(&conn)?;
+
         let db = Self { conn };
         db.init_schema()?;
         db.run_migrations()?;
@@ -61,10 +63,26 @@ impl StateDb {
     #[cfg(test)]
     pub fn in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
+        Self::apply_pragmas(&conn)?;
         let db = Self { conn };
         db.init_schema()?;
         db.run_migrations()?;
         Ok(db)
+    }
+
+    /// Apply performance-critical PRAGMAs to a connection.
+    fn apply_pragmas(conn: &Connection) -> Result<()> {
+        // journal_mode=WAL may fail for in-memory DBs; ignore errors
+        let _ = conn.pragma_update(None, "journal_mode", "WAL");
+        // These are safe for both file and in-memory databases
+        let _ = conn.pragma_update(None, "synchronous", "NORMAL");
+        let _ = conn.pragma_update(None, "cache_size", -64000_i64);
+        let _ = conn.pragma_update(None, "mmap_size", 268435456_i64);
+        let _ = conn.pragma_update(None, "temp_store", "MEMORY");
+        let _ = conn.pragma_update(None, "journal_size_limit", 67108864_i64);
+        let _ = conn.pragma_update(None, "wal_autocheckpoint", 1000_i64);
+        let _ = conn.pragma_update(None, "busy_timeout", 5000_i64);
+        Ok(())
     }
 
     fn init_schema(&self) -> Result<()> {
@@ -1210,7 +1228,7 @@ impl StateDb {
         width: Option<u32>,
         height: Option<u32>,
     ) -> Result<i64> {
-        self.conn.execute(
+        let mut stmt = self.conn.prepare_cached(
             "INSERT INTO downloads (manifest_id, canvas_id, canvas_index, image_url, status,
                 canvas_label, width, height)
              VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7)
@@ -1218,11 +1236,11 @@ impl StateDb {
                 canvas_label = COALESCE(excluded.canvas_label, downloads.canvas_label),
                 width = COALESCE(excluded.width, downloads.width),
                 height = COALESCE(excluded.height, downloads.height)",
-            params![
-                manifest_id, canvas_id, canvas_index as i64, image_url,
-                canvas_label, width, height,
-            ],
         )?;
+        stmt.execute(params![
+            manifest_id, canvas_id, canvas_index as i64, image_url,
+            canvas_label, width, height,
+        ])?;
         Ok(self.conn.last_insert_rowid())
     }
 
@@ -1257,6 +1275,94 @@ impl StateDb {
         Ok(())
     }
 
+    /// Flush a batch of download results in a single transaction.
+    /// Each entry is (manifest_id, canvas_id, local_path, sha256, error).
+    pub fn flush_download_results(&self, results: &[DownloadResultBatch]) -> Result<()> {
+        self.conn.execute_batch("BEGIN TRANSACTION;")?;
+        let result = (|| -> Result<()> {
+            for r in results {
+                match &r.error {
+                    Some(err) => {
+                        self.conn.execute(
+                            "UPDATE downloads SET status = 'failed', error_message = ?1,
+                             updated_at = datetime('now') WHERE manifest_id = ?2 AND canvas_id = ?3",
+                            params![err, r.manifest_id, r.canvas_id],
+                        )?;
+                    }
+                    None => {
+                        self.conn.execute(
+                            "UPDATE downloads SET status = 'complete', local_path = ?1, sha256 = ?2,
+                             updated_at = datetime('now') WHERE manifest_id = ?3 AND canvas_id = ?4",
+                            params![r.local_path, r.sha256, r.manifest_id, r.canvas_id],
+                        )?;
+                    }
+                }
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT;")?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                Err(e)
+            }
+        }
+    }
+
+    /// Reset failed downloads back to pending for retry.
+    pub fn reset_failed_to_pending(&self, manifest_id: &str) -> Result<usize> {
+        let count = self.conn.execute(
+            "UPDATE downloads SET status = 'pending', error_message = NULL,
+             updated_at = datetime('now') WHERE manifest_id = ?1 AND status = 'failed'",
+            params![manifest_id],
+        )?;
+        Ok(count)
+    }
+
+    /// Reset a single failed download to pending.
+    pub fn reset_failed_to_pending_single(&self, manifest_id: &str, canvas_id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE downloads SET status = 'pending', error_message = NULL,
+             updated_at = datetime('now') WHERE manifest_id = ?1 AND canvas_id = ?2",
+            params![manifest_id, canvas_id],
+        )?;
+        Ok(())
+    }
+
+    /// Get all completed downloads, optionally filtered by manifest.
+    pub fn get_completed_downloads(&self, manifest_id: Option<&str>) -> Result<Vec<CompletedDownload>> {
+        let (sql, params_vec): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = match manifest_id {
+            Some(mid) => (
+                "SELECT manifest_id, canvas_id, local_path, COALESCE(sha256, '') \
+                 FROM downloads WHERE status = 'complete' AND local_path IS NOT NULL \
+                 AND manifest_id = ?1 ORDER BY manifest_id, canvas_index".to_string(),
+                vec![Box::new(mid.to_string()) as Box<dyn rusqlite::types::ToSql>],
+            ),
+            None => (
+                "SELECT manifest_id, canvas_id, local_path, COALESCE(sha256, '') \
+                 FROM downloads WHERE status = 'complete' AND local_path IS NOT NULL \
+                 ORDER BY manifest_id, canvas_index".to_string(),
+                vec![],
+            ),
+        };
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+        let mut stmt = self.conn.prepare(&sql)?;
+        let records = stmt
+            .query_map(params_refs.as_slice(), |row| {
+                Ok(CompletedDownload {
+                    manifest_id: row.get(0)?,
+                    canvas_id: row.get(1)?,
+                    local_path: row.get(2)?,
+                    sha256: row.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(records)
+    }
+
     /// Get pending or failed downloads for a manifest (for resume).
     pub fn get_incomplete_downloads(&self, manifest_id: &str) -> Result<Vec<DownloadRecord>> {
         let mut stmt = self.conn.prepare(
@@ -1282,12 +1388,23 @@ impl StateDb {
 
     /// Check if a canvas has already been downloaded successfully.
     pub fn is_downloaded(&self, manifest_id: &str, canvas_id: &str) -> Result<bool> {
-        let count: i64 = self.conn.query_row(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT COUNT(*) FROM downloads WHERE manifest_id = ?1 AND canvas_id = ?2 AND status = 'complete'",
-            params![manifest_id, canvas_id],
-            |row| row.get(0),
         )?;
+        let count: i64 = stmt.query_row(params![manifest_id, canvas_id], |row| row.get(0))?;
         Ok(count > 0)
+    }
+
+    /// Get all completed canvas IDs for a manifest in a single query.
+    /// Much more efficient than calling is_downloaded() per canvas.
+    pub fn get_downloaded_canvas_ids(&self, manifest_id: &str) -> Result<std::collections::HashSet<String>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT canvas_id FROM downloads WHERE manifest_id = ?1 AND status = 'complete'",
+        )?;
+        let ids = stmt
+            .query_map(params![manifest_id], |row| row.get::<_, String>(0))?
+            .collect::<Result<std::collections::HashSet<_>, _>>()?;
+        Ok(ids)
     }
 
     /// Get download statistics for a manifest.
@@ -1819,6 +1936,119 @@ impl StateDb {
 
         Ok((records, total as usize))
     }
+
+    // ─── Cross-Record Linking ────────────────────────────────────────────
+
+    /// Find potential cross-record links by matching surname+name tags across manifests.
+    pub fn find_cross_record_candidates(
+        &self,
+        _min_score: f64,
+        limit: usize,
+    ) -> Result<Vec<CrossRecordCandidate>> {
+        // Find (surname, given_name) pairs that appear in tags across multiple manifests
+        let mut stmt = self.conn.prepare(
+            "SELECT t1.value AS surname, t2.value AS given_name,
+                    COUNT(DISTINCT d.manifest_id) AS manifest_count,
+                    COUNT(DISTINCT d.id) AS record_count
+             FROM tags t1
+             JOIN tags t2 ON t1.download_id = t2.download_id
+             JOIN downloads d ON t1.download_id = d.id
+             WHERE t1.tag_type = 'surname' AND t2.tag_type = 'name'
+             GROUP BY LOWER(t1.value), LOWER(t2.value)
+             HAVING manifest_count > 1
+             ORDER BY manifest_count DESC, record_count DESC
+             LIMIT ?1",
+        )?;
+
+        let candidates = stmt
+            .query_map(params![limit as i64], |row| {
+                Ok(CrossRecordCandidateRow {
+                    surname: row.get(0)?,
+                    given_name: row.get(1)?,
+                    manifest_count: row.get(2)?,
+                    record_count: row.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // For each candidate, fetch the specific records
+        let mut results = Vec::with_capacity(candidates.len());
+        for c in candidates {
+            let records = self.get_cross_record_details(&c.surname, &c.given_name)?;
+            let score = c.manifest_count as f64 * 0.5 + c.record_count as f64 * 0.2;
+            results.push(CrossRecordCandidate {
+                surname: c.surname,
+                given_name: c.given_name,
+                manifest_count: c.manifest_count,
+                record_count: c.record_count,
+                score,
+                records,
+            });
+        }
+
+        Ok(results)
+    }
+
+    fn get_cross_record_details(&self, surname: &str, given_name: &str) -> Result<Vec<CrossRecordDetail>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT d.manifest_id, d.canvas_id, m.doc_type, m.year
+             FROM tags t1
+             JOIN tags t2 ON t1.download_id = t2.download_id
+             JOIN downloads d ON t1.download_id = d.id
+             JOIN manifests m ON d.manifest_id = m.id
+             WHERE t1.tag_type = 'surname' AND LOWER(t1.value) = LOWER(?1)
+               AND t2.tag_type = 'name' AND LOWER(t2.value) = LOWER(?2)
+             ORDER BY m.year",
+        )?;
+
+        let records = stmt
+            .query_map(params![surname, given_name], |row| {
+                Ok(CrossRecordDetail {
+                    manifest_id: row.get(0)?,
+                    canvas_id: row.get(1)?,
+                    doc_type: row.get(2)?,
+                    year: row.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(records)
+    }
+
+    // ─── Dashboard Methods ───────────────────────────────────────────────
+
+    /// Get recent manifest download status for the TUI dashboard.
+    pub fn get_recent_manifest_status(&self, limit: usize) -> Result<Vec<ManifestStatusRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT m.id, m.doc_type, m.year,
+                    CASE
+                        WHEN COUNT(d.id) = 0 THEN 'empty'
+                        WHEN SUM(CASE WHEN d.status = 'complete' THEN 1 ELSE 0 END) = COUNT(d.id) THEN 'complete'
+                        WHEN SUM(CASE WHEN d.status = 'failed' THEN 1 ELSE 0 END) > 0 THEN 'partial'
+                        ELSE 'active'
+                    END as status,
+                    SUM(CASE WHEN d.status = 'complete' THEN 1 ELSE 0 END) as completed,
+                    COUNT(d.id) as total
+             FROM manifests m
+             LEFT JOIN downloads d ON m.id = d.manifest_id
+             GROUP BY m.id
+             ORDER BY m.fetched_at DESC
+             LIMIT ?1",
+        )?;
+
+        let records = stmt
+            .query_map(params![limit as i64], |row| {
+                Ok(ManifestStatusRow {
+                    id: row.get(0)?,
+                    doc_type: row.get(1)?,
+                    year: row.get(2)?,
+                    status: row.get(3)?,
+                    completed: row.get(4)?,
+                    total: row.get(5)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(records)
+    }
 }
 
 // ─── Data Structures ────────────────────────────────────────────────────
@@ -1877,6 +2107,23 @@ pub struct DownloadStats {
     pub pending: usize,
 }
 
+/// Record for a completed download (used by verify command).
+pub struct CompletedDownload {
+    pub manifest_id: String,
+    pub canvas_id: String,
+    pub local_path: String,
+    pub sha256: String,
+}
+
+/// Batch entry for flushing download results in a single transaction.
+pub struct DownloadResultBatch {
+    pub manifest_id: String,
+    pub canvas_id: String,
+    pub local_path: String,
+    pub sha256: String,
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct TagRecord {
     pub id: i64,
@@ -1929,6 +2176,44 @@ pub struct ExtendedStats {
     pub registry_results: usize,
     pub registries: usize,
     pub ocr_results: usize,
+}
+
+/// Row from cross-record candidate query (internal).
+struct CrossRecordCandidateRow {
+    surname: String,
+    given_name: String,
+    manifest_count: i64,
+    record_count: i64,
+}
+
+/// A cross-record candidate: a person appearing across multiple registries.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CrossRecordCandidate {
+    pub surname: String,
+    pub given_name: String,
+    pub manifest_count: i64,
+    pub record_count: i64,
+    pub score: f64,
+    pub records: Vec<CrossRecordDetail>,
+}
+
+/// Detail of a single record for a cross-record candidate.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CrossRecordDetail {
+    pub manifest_id: String,
+    pub canvas_id: String,
+    pub doc_type: Option<String>,
+    pub year: Option<String>,
+}
+
+/// Row for dashboard manifest status.
+pub struct ManifestStatusRow {
+    pub id: String,
+    pub doc_type: Option<String>,
+    pub year: Option<String>,
+    pub status: String,
+    pub completed: i64,
+    pub total: i64,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]

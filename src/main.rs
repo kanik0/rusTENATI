@@ -95,6 +95,21 @@ async fn main() -> Result<()> {
         Command::Serve(args) => {
             cli::commands::serve::run(args).await?;
         }
+        Command::Verify(args) => {
+            cli::commands::verify::run(args, cli.json)?;
+        }
+        Command::Export(args) => {
+            cli::commands::export::run(args)?;
+        }
+        Command::Thumbnail(args) => {
+            cli::commands::thumbnail::run(args)?;
+        }
+        Command::Link { action } => {
+            cli::commands::link::run(action, cli.json)?;
+        }
+        Command::Dashboard(args) => {
+            cli::commands::dashboard::run(args)?;
+        }
     }
 
     Ok(())

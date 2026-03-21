@@ -3,16 +3,20 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::client::antenati::AntenatiClient;
+use crate::client::circuit_breaker::CircuitBreaker;
 use crate::client::rate_limiter::Limiter;
 use crate::client::waf;
+use crate::download::adaptive::AdaptiveConcurrency;
 use crate::download::progress;
-use crate::download::state::StateDb;
+use crate::download::state::{DownloadResultBatch, StateDb};
 use crate::models::manifest::{Canvas, IiifManifest};
 use crate::output;
 
@@ -28,6 +32,7 @@ pub struct DownloadConfig {
     pub skip_existing: bool,
     pub page_range: Option<PageRange>,
     pub resume: bool,
+    pub adaptive: bool,
 }
 
 /// Parsed page range (e.g., "1-50" or "10,20,30-40").
@@ -92,6 +97,16 @@ pub async fn download_manifest(
 
     info!("Downloading {} images from '{}'", total, manifest.title());
 
+    // Connection prewarming: establish TCP+TLS+HTTP/2 before parallel downloads
+    if let Some((_, first_canvas)) = canvases.first() {
+        let warmup_url = first_canvas.full_image_url(&config.image_format);
+        debug!("Prewarming connection to {}", warmup_url);
+        match client.http().head(&warmup_url).send().await {
+            Ok(resp) => debug!("Connection prewarmed (HTTP version: {:?})", resp.version()),
+            Err(e) => debug!("Prewarm failed (non-fatal): {e}"),
+        }
+    }
+
     // Dry run: just list what would be downloaded
     if config.dry_run {
         println!("Dry run: would download {} images", total);
@@ -122,14 +137,12 @@ pub async fn download_manifest(
         )?;
     }
 
-    // Resume: filter out already completed downloads
+    // Resume: filter out already completed downloads (single bulk query)
     let canvases: Vec<(usize, &Canvas)> = if config.resume {
-        let mut filtered = Vec::new();
-        for (i, canvas) in canvases {
-            if !state_db.is_downloaded(&manifest.id, &canvas.id)? {
-                filtered.push((i, canvas));
-            }
-        }
+        let completed = state_db.get_downloaded_canvas_ids(&manifest.id)?;
+        let filtered: Vec<_> = canvases.into_iter()
+            .filter(|(_, canvas)| !completed.contains(&canvas.id))
+            .collect();
         let skipped = total - filtered.len();
         if skipped > 0 {
             info!("Resuming: skipping {skipped} already completed downloads");
@@ -152,11 +165,22 @@ pub async fn download_manifest(
     });
 
     // Create progress bar
-    let multi = progress::create_multi_progress();
-    let main_bar = multi.add(progress::create_main_bar(remaining as u64));
+    let main_bar = progress::create_main_bar(remaining as u64);
 
     // Download with semaphore-limited concurrency
-    let semaphore = Arc::new(Semaphore::new(config.concurrency));
+    // Use adaptive concurrency (AIMD) if enabled, otherwise fixed semaphore
+    let adaptive: Option<Arc<AdaptiveConcurrency>> = if config.adaptive {
+        Some(Arc::new(AdaptiveConcurrency::new(config.concurrency as u32, 2, (config.concurrency * 4) as u32)))
+    } else {
+        None
+    };
+    let semaphore = adaptive.as_ref()
+        .map(|a| a.semaphore().clone())
+        .unwrap_or_else(|| Arc::new(Semaphore::new(config.concurrency)));
+
+    // Per-host circuit breaker (5 consecutive failures → 10s cooldown)
+    let circuit_breaker = Arc::new(CircuitBreaker::new(5, Duration::from_secs(10)));
+
     let mut handles = Vec::with_capacity(remaining);
 
     let images_dir = output_dir.join("images");
@@ -180,6 +204,8 @@ pub async fn download_manifest(
         let skip_existing = config.skip_existing;
         let delay_ms = config.delay_ms;
         let cancel = cancel_token.clone();
+        let adaptive = adaptive.clone();
+        let cb = circuit_breaker.clone();
 
         let handle = tokio::spawn(async move {
             let result = download_with_retry(
@@ -191,11 +217,27 @@ pub async fn download_manifest(
                 skip_existing,
                 delay_ms,
                 &cancel,
+                &cb,
             )
             .await;
 
             main_bar.inc(1);
             drop(permit);
+
+            // Feed result back to adaptive concurrency controller
+            match &result {
+                Ok(DownloadOutcome::Downloaded(_)) => {
+                    if let Some(ref ac) = adaptive {
+                        ac.report_success();
+                    }
+                }
+                Err(_) => {
+                    if let Some(ref ac) = adaptive {
+                        ac.report_throttle();
+                    }
+                }
+                _ => {}
+            }
 
             match result {
                 Ok(DownloadOutcome::Downloaded(checksum)) => {
@@ -245,11 +287,13 @@ pub async fn download_manifest(
         handles.push(handle);
     }
 
-    // Collect results
+    // Collect results and flush to DB in batches
+    const BATCH_SIZE: usize = 50;
     let mut summary = DownloadSummary {
         total,
         ..Default::default()
     };
+    let mut batch: Vec<DownloadResultBatch> = Vec::with_capacity(BATCH_SIZE);
 
     for handle in handles {
         let result = handle.await?;
@@ -257,20 +301,38 @@ pub async fn download_manifest(
             if err == "cancelled" {
                 summary.cancelled += 1;
             } else {
-                state_db.mark_failed(&result.manifest_id, &result.canvas_id, err)?;
+                batch.push(DownloadResultBatch {
+                    manifest_id: result.manifest_id,
+                    canvas_id: result.canvas_id,
+                    local_path: String::new(),
+                    sha256: String::new(),
+                    error: Some(err.clone()),
+                });
                 summary.failed += 1;
             }
         } else if result.skipped {
             summary.skipped += 1;
         } else {
-            state_db.mark_complete(
-                &result.manifest_id,
-                &result.canvas_id,
-                &result.local_path,
-                &result.sha256,
-            )?;
+            batch.push(DownloadResultBatch {
+                manifest_id: result.manifest_id,
+                canvas_id: result.canvas_id,
+                local_path: result.local_path,
+                sha256: result.sha256,
+                error: None,
+            });
             summary.downloaded += 1;
         }
+
+        // Flush batch when it reaches threshold
+        if batch.len() >= BATCH_SIZE {
+            state_db.flush_download_results(&batch)?;
+            batch.clear();
+        }
+    }
+
+    // Flush remaining results
+    if !batch.is_empty() {
+        state_db.flush_download_results(&batch)?;
     }
 
     main_bar.finish_with_message(if cancel_token.is_cancelled() {
@@ -304,13 +366,16 @@ async fn download_with_retry(
     skip_existing: bool,
     delay_ms: u64,
     cancel: &CancellationToken,
+    circuit_breaker: &CircuitBreaker,
 ) -> Result<DownloadOutcome> {
-    // Skip if file already exists
+    // Skip if file already exists and is non-empty
     if skip_existing && filepath.exists() {
-        debug!("Skipping existing file: {}", filepath.display());
-        let data = tokio::fs::read(filepath).await?;
-        let checksum = hex::encode(Sha256::digest(&data));
-        return Ok(DownloadOutcome::Skipped(checksum));
+        if let Ok(meta) = tokio::fs::metadata(filepath).await {
+            if meta.len() > 0 {
+                debug!("Skipping existing file: {} ({} bytes)", filepath.display(), meta.len());
+                return Ok(DownloadOutcome::Skipped(String::new()));
+            }
+        }
     }
 
     let mut last_error = None;
@@ -320,6 +385,17 @@ async fn download_with_retry(
         // Check cancellation
         if cancel.is_cancelled() {
             return Ok(DownloadOutcome::Cancelled);
+        }
+
+        // Check circuit breaker — if open, wait for cooldown
+        if let Err(wait) = circuit_breaker.check().await {
+            debug!("Circuit breaker open for {label}, waiting {:?}", wait);
+            tokio::select! {
+                _ = tokio::time::sleep(wait) => {}
+                _ = cancel.cancelled() => {
+                    return Ok(DownloadOutcome::Cancelled);
+                }
+            }
         }
 
         // Rate limit
@@ -337,10 +413,18 @@ async fn download_with_retry(
         }
 
         match attempt_download(client, url, filepath).await {
-            Ok(checksum) => return Ok(DownloadOutcome::Downloaded(checksum)),
+            Ok(checksum) => {
+                circuit_breaker.report_success().await;
+                return Ok(DownloadOutcome::Downloaded(checksum));
+            }
             Err(e) => {
                 let is_retryable = is_retryable_error(&e);
                 let status_code = extract_status_code(&e);
+
+                // Report failure to circuit breaker for server errors and rate limits
+                if matches!(status_code, Some(429) | Some(500..=599)) {
+                    circuit_breaker.report_failure().await;
+                }
 
                 if !is_retryable || attempt == MAX_RETRIES {
                     last_error = Some(e);
@@ -350,12 +434,10 @@ async fn download_with_retry(
                 // Handle specific status codes
                 let wait = match status_code {
                     Some(429) => {
-                        // Rate limited - use longer backoff
                         warn!("Rate limited (429) on {label}, backing off {backoff_ms}ms");
                         backoff_ms * 2
                     }
                     Some(403) => {
-                        // Possible WAF challenge
                         warn!("HTTP 403 on {label}, may be WAF challenge");
                         backoff_ms
                     }
@@ -410,18 +492,30 @@ async fn attempt_download(
         anyhow::bail!("HTTP {} for {}", status.as_u16(), url);
     }
 
-    let bytes = response.bytes().await?;
+    // Stream response to file with incremental SHA256
+    let mut stream = response.bytes_stream();
+    let mut file = tokio::fs::File::create(filepath).await
+        .with_context(|| format!("Failed to create file: {}", filepath.display()))?;
+    let mut hasher = Sha256::new();
+    let mut total_bytes: u64 = 0;
 
-    if bytes.is_empty() {
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("Error reading response stream")?;
+        hasher.update(&chunk);
+        file.write_all(&chunk).await
+            .with_context(|| format!("Failed to write to {}", filepath.display()))?;
+        total_bytes += chunk.len() as u64;
+    }
+
+    file.flush().await?;
+
+    if total_bytes == 0 {
+        // Clean up empty file
+        let _ = tokio::fs::remove_file(filepath).await;
         anyhow::bail!("Empty response for {url}");
     }
 
-    // Compute SHA256
-    let checksum = hex::encode(Sha256::digest(&bytes));
-
-    // Write to disk
-    tokio::fs::write(filepath, &bytes).await?;
-
+    let checksum = hex::encode(hasher.finalize());
     Ok(checksum)
 }
 
@@ -467,13 +561,9 @@ fn extract_status_code(e: &anyhow::Error) -> Option<u16> {
     None
 }
 
-/// Simple pseudo-random jitter in [0.0, 1.0) using time-based seed.
+/// Random jitter in [0.0, 1.0) for retry backoff.
 fn rand_jitter() -> f64 {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos();
-    (nanos % 1000) as f64 / 1000.0
+    fastrand::f64()
 }
 
 struct DownloadResult {

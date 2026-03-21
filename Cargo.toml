@@ -59,6 +59,10 @@ hex = "0.4"
 
 # Async utilities
 tokio-util = "0.7"
+futures-util = "0.3"
+
+# Random number generation (for download jitter)
+fastrand = "2"
 
 # Async trait
 async-trait = "0.1"
@@ -67,10 +71,17 @@ async-trait = "0.1"
 base64 = "0.22"
 
 # Web server (for `serve` command)
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
 tower-http = { version = "0.6", features = ["fs", "cors"] }
 rust-embed = "8"
 mime_guess = "2"
+
+# Image processing (for thumbnail generation)
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+
+# TUI dashboard
+ratatui = "0.29"
+crossterm = "0.28"
 
 [dev-dependencies]
 tempfile = "3"
