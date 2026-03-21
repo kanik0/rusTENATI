@@ -84,6 +84,24 @@ pub enum Command {
 
     /// Start a local web server to browse downloaded documents
     Serve(commands::serve::ServeArgs),
+
+    /// Verify integrity of downloaded files
+    Verify(commands::verify::VerifyArgs),
+
+    /// Export data to CSV or JSON
+    Export(commands::export::ExportArgs),
+
+    /// Generate thumbnails for downloaded images
+    Thumbnail(commands::thumbnail::ThumbnailArgs),
+
+    /// Cross-record linking: find the same person across different registries
+    Link {
+        #[command(subcommand)]
+        action: commands::link::LinkAction,
+    },
+
+    /// Interactive TUI dashboard showing download stats and progress
+    Dashboard(commands::dashboard::DashboardArgs),
 }
 
 #[derive(Debug, Subcommand)]

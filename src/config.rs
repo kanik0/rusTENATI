@@ -100,7 +100,7 @@ impl Default for Config {
 impl Default for DownloadConfig {
     fn default() -> Self {
         Self {
-            concurrency: 4,
+            concurrency: 8,
             delay_ms: 500,
             quality: "full".into(),
             format: "jpg".into(),

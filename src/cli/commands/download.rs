@@ -2,6 +2,8 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use clap::Args;
+use futures_util::future;
+use futures_util::stream::{self, StreamExt};
 
 use crate::client::antenati::AntenatiClient;
 use crate::client::rate_limiter;
@@ -16,7 +18,7 @@ pub struct DownloadArgs {
     pub source: Option<String>,
 
     /// Parallel downloads
-    #[arg(short, long, default_value = "4")]
+    #[arg(short, long, default_value = "8")]
     pub jobs: usize,
 
     /// Image format: jpg, png
@@ -97,6 +99,14 @@ pub struct DownloadArgs {
     /// Max idle connections per host in the HTTP pool
     #[arg(long)]
     pub connections: Option<usize>,
+
+    /// Retry previously failed downloads
+    #[arg(long)]
+    pub retry_failed: bool,
+
+    /// Enable adaptive concurrency (AIMD: auto-adjusts parallelism based on server response)
+    #[arg(long)]
+    pub adaptive: bool,
 }
 
 pub async fn run(
@@ -152,6 +162,14 @@ async fn run_single_download(
     };
     state_db.upsert_registry_from_manifest(&manifest, ark_url)?;
 
+    // Reset failed downloads for retry
+    if args.retry_failed {
+        let reset = state_db.reset_failed_to_pending(&manifest.id)?;
+        if reset > 0 {
+            eprintln!("Reset {reset} failed downloads for retry");
+        }
+    }
+
     let limiter = rate_limiter::create_rate_limiter(effective_rps(args));
 
     let page_range = args
@@ -168,6 +186,7 @@ async fn run_single_download(
         skip_existing: args.skip_existing,
         page_range,
         resume: args.resume,
+        adaptive: args.adaptive,
     };
 
     let summary = engine::download_manifest(
@@ -224,42 +243,63 @@ async fn run_batch_download(
     eprintln!("Searching registries for {filter_desc}...");
 
     let mut all_results = Vec::new();
-    let mut page = 1u32;
     let page_size = 100u32;
     let filter_lower = args.filter.as_ref().map(|f| f.to_lowercase());
 
-    loop {
-        let params = RegistrySearchParams {
-            locality: args.locality.as_deref(),
-            archive_name: archive_name.as_deref(),
-            year_from: args.year_from,
-            year_to: args.year_to,
-            doc_type: args.doc_type.as_deref(),
-            page,
-            page_size,
-            ..Default::default()
-        };
+    // Fetch first page to discover total_pages
+    let first_params = RegistrySearchParams {
+        locality: args.locality.as_deref(),
+        archive_name: archive_name.as_deref(),
+        year_from: args.year_from,
+        year_to: args.year_to,
+        doc_type: args.doc_type.as_deref(),
+        page: 1,
+        page_size,
+        ..Default::default()
+    };
+    let first_page = client.search_registries_params(&first_params).await?;
+    let total_pages = first_page.total_pages;
+    all_results.extend(first_page.results);
 
-        let results = client.search_registries_params(&params).await?;
-
-        let total_pages = results.total_pages;
-
-        if let Some(ref filter) = filter_lower {
-            all_results.extend(results.results.into_iter().filter(|r| {
-                let loc = r.context.rsplit(" > ").next().unwrap_or(&r.context).trim();
-                loc.to_lowercase().contains(filter)
-            }));
-        } else {
-            all_results.extend(results.results);
+    // Fetch remaining pages in parallel
+    if total_pages > 1 && (args.all || all_results.len() < args.max_registries) {
+        let remaining: Vec<u32> = (2..=total_pages).collect();
+        let page_futures = remaining.into_iter().map(|p| {
+            let client = client.clone();
+            let locality = args.locality.clone();
+            let archive_name = archive_name.clone();
+            let year_from = args.year_from;
+            let year_to = args.year_to;
+            let doc_type = args.doc_type.clone();
+            async move {
+                let params = RegistrySearchParams {
+                    locality: locality.as_deref(),
+                    archive_name: archive_name.as_deref(),
+                    year_from,
+                    year_to,
+                    doc_type: doc_type.as_deref(),
+                    page: p,
+                    page_size,
+                    ..Default::default()
+                };
+                client.search_registries_params(&params).await
+            }
+        });
+        let page_results = futures_util::future::join_all(page_futures).await;
+        for result in page_results {
+            match result {
+                Ok(page_data) => all_results.extend(page_data.results),
+                Err(e) => eprintln!("Warning: failed to fetch search page: {e}"),
+            }
         }
+    }
 
-        if page >= total_pages {
-            break;
-        }
-        if !args.all && all_results.len() >= args.max_registries {
-            break;
-        }
-        page += 1;
+    // Apply filter
+    if let Some(ref filter) = filter_lower {
+        all_results.retain(|r| {
+            let loc = r.context.rsplit(" > ").next().unwrap_or(&r.context).trim();
+            loc.to_lowercase().contains(filter)
+        });
     }
 
     if !args.all {
@@ -305,6 +345,7 @@ async fn run_batch_download(
         skip_existing: args.skip_existing,
         page_range,
         resume: args.resume,
+        adaptive: args.adaptive,
     };
 
     let mut total_summary = DownloadSummary::default();
@@ -457,6 +498,7 @@ async fn run_noah_mode(
         skip_existing: args.skip_existing,
         page_range,
         resume: args.resume,
+        adaptive: args.adaptive,
     };
 
     let mut grand_total = DownloadSummary::default();
@@ -476,46 +518,61 @@ async fn run_noah_mode(
         // Convert slug to archive name for Solr query
         let archive_name = archive.name.clone();
 
-        // Fetch all registries for this archive
+        // Fetch all registries for this archive (parallel pagination)
         let mut all_results = Vec::new();
-        let mut page = 1u32;
         let page_size = 100u32;
 
-        loop {
-            let params = RegistrySearchParams {
-                archive_name: Some(&archive_name),
-                year_from: args.year_from,
-                year_to: args.year_to,
-                doc_type: args.doc_type.as_deref(),
-                page,
-                page_size,
-                ..Default::default()
-            };
+        let first_params = RegistrySearchParams {
+            archive_name: Some(&archive_name),
+            year_from: args.year_from,
+            year_to: args.year_to,
+            doc_type: args.doc_type.as_deref(),
+            page: 1,
+            page_size,
+            ..Default::default()
+        };
 
-            match client.search_registries_params(&params).await {
-                Ok(results) => {
-                    let total_pages = results.total_pages;
-                    if page == 1 {
-                        eprintln!("  {} registries found", results.total);
-                    }
-                    all_results.extend(results.results);
+        match client.search_registries_params(&first_params).await {
+            Ok(first_page) => {
+                let total_pages = first_page.total_pages;
+                eprintln!("  {} registries found", first_page.total);
+                all_results.extend(first_page.results);
 
-                    if page >= total_pages {
-                        break;
+                // Fetch remaining pages in parallel
+                if total_pages > 1 {
+                    let remaining: Vec<u32> = (2..=total_pages).collect();
+                    let page_futures = remaining.into_iter().map(|p| {
+                        let client = client.clone();
+                        let archive_name = archive_name.clone();
+                        let year_from = args.year_from;
+                        let year_to = args.year_to;
+                        let doc_type = args.doc_type.clone();
+                        async move {
+                            let params = RegistrySearchParams {
+                                archive_name: Some(&archive_name),
+                                year_from,
+                                year_to,
+                                doc_type: doc_type.as_deref(),
+                                page: p,
+                                page_size,
+                                ..Default::default()
+                            };
+                            client.search_registries_params(&params).await
+                        }
+                    });
+                    let page_results = future::join_all(page_futures).await;
+                    for result in page_results {
+                        match result {
+                            Ok(page_data) => all_results.extend(page_data.results),
+                            Err(e) => eprintln!("  Warning: failed to fetch search page: {e}"),
+                        }
                     }
-                    if !args.all
-                        && args.max_registries > 0
-                        && all_results.len() >= args.max_registries
-                    {
-                        break;
-                    }
-                    page += 1;
                 }
-                Err(e) => {
-                    eprintln!("  Error searching archive: {e}");
-                    failed_archives.push(archive.name.clone());
-                    break;
-                }
+            }
+            Err(e) => {
+                eprintln!("  Error searching archive: {e}");
+                failed_archives.push(archive.name.clone());
+                continue;
             }
         }
 
@@ -559,74 +616,74 @@ async fn run_noah_mode(
             continue;
         }
 
-        // Download each registry
-        for (reg_idx, result) in all_results.iter().enumerate() {
-            let loc = result
-                .context
-                .rsplit(" > ")
-                .next()
-                .unwrap_or(&result.context)
-                .trim();
-            eprintln!(
-                "  [{}/{}] {} - {} - {}",
-                reg_idx + 1,
-                archive_registries,
-                result.year,
-                result.doc_type,
-                loc,
-            );
+        // Download registries with manifest-level concurrency (4 at a time)
+        // Uses buffer_unordered to avoid spawning tasks (StateDb is !Sync)
+        const MANIFEST_CONCURRENCY: usize = 4;
 
-            let manifest_url = match client.resolve_manifest_url(&result.ark_url).await {
-                Ok(url) => url,
-                Err(e) => {
-                    eprintln!("    Error resolving manifest: {e}");
-                    total_registries_failed += 1;
-                    continue;
+        let results: Vec<Option<DownloadSummary>> = stream::iter(
+            all_results.iter().enumerate()
+        )
+        .map(|(reg_idx, result)| {
+            let client = client.clone();
+            let limiter = limiter.clone();
+            let config = &config;
+            let state_db = &state_db;
+            async move {
+                let loc = result.context.rsplit(" > ").next().unwrap_or(&result.context).trim();
+                eprintln!(
+                    "  [{}/{}] {} - {} - {}",
+                    reg_idx + 1, archive_registries, result.year, result.doc_type, loc,
+                );
+
+                let manifest_url = match client.resolve_manifest_url(&result.ark_url).await {
+                    Ok(url) => url,
+                    Err(e) => {
+                        eprintln!("    Error resolving manifest: {e}");
+                        return None;
+                    }
+                };
+
+                let manifest = match client.get_manifest(&manifest_url).await {
+                    Ok(m) => m,
+                    Err(e) => {
+                        eprintln!("    Error fetching manifest: {e}");
+                        return None;
+                    }
+                };
+
+                let output_dir = output::build_output_dir(&output::base_dir(), &manifest);
+
+                let summary = match engine::download_manifest(
+                    client, limiter, state_db, &manifest, &output_dir, config, Some(&result.ark_url),
+                ).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("    Error downloading: {e}");
+                        return None;
+                    }
+                };
+
+                eprintln!("    {summary}");
+                Some(summary)
+            }
+        })
+        .buffer_unordered(MANIFEST_CONCURRENCY)
+        .collect()
+        .await;
+
+        for result in results {
+            match result {
+                Some(summary) => {
+                    grand_total.total += summary.total;
+                    grand_total.downloaded += summary.downloaded;
+                    grand_total.skipped += summary.skipped;
+                    grand_total.failed += summary.failed;
+                    grand_total.cancelled += summary.cancelled;
+                    total_registries_processed += 1;
                 }
-            };
-
-            let manifest = match client.get_manifest(&manifest_url).await {
-                Ok(m) => m,
-                Err(e) => {
-                    eprintln!("    Error fetching manifest: {e}");
+                None => {
                     total_registries_failed += 1;
-                    continue;
                 }
-            };
-
-            let output_dir = output::build_output_dir(&output::base_dir(), &manifest);
-
-            let summary = match engine::download_manifest(
-                client.clone(),
-                limiter.clone(),
-                &state_db,
-                &manifest,
-                &output_dir,
-                &config,
-                Some(&result.ark_url),
-            )
-            .await
-            {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("    Error downloading: {e}");
-                    total_registries_failed += 1;
-                    continue;
-                }
-            };
-
-            eprintln!("    {summary}");
-            grand_total.total += summary.total;
-            grand_total.downloaded += summary.downloaded;
-            grand_total.skipped += summary.skipped;
-            grand_total.failed += summary.failed;
-            grand_total.cancelled += summary.cancelled;
-            total_registries_processed += 1;
-
-            // If shutdown was requested, stop
-            if summary.cancelled > 0 {
-                eprintln!("\nNoah mode interrupted. Progress saved — use --resume --noah to continue.");
-                break;
             }
         }
     }

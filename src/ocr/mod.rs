@@ -1,6 +1,7 @@
 pub mod azure;
 pub mod claude_vision;
 pub mod google;
+pub mod pipeline;
 pub mod transkribus;
 
 use std::path::Path;

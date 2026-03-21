@@ -1,10 +1,15 @@
 pub mod browse;
 pub mod config;
+pub mod dashboard;
 pub mod download;
+pub mod export;
 pub mod info;
+pub mod link;
 pub mod ocr;
 pub mod query;
 pub mod search;
 pub mod serve;
 pub mod status;
 pub mod tags;
+pub mod thumbnail;
+pub mod verify;
