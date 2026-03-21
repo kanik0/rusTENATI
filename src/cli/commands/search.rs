@@ -294,6 +294,9 @@ fn cache_registry_results(
         db.insert_registry_result(query_id, result)?;
     }
 
+    // Populate persistent registries catalog
+    db.upsert_registries_batch(&results.results)?;
+
     Ok(())
 }
 

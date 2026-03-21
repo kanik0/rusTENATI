@@ -2,6 +2,7 @@
 
 let currentView = 'dashboard';
 let browseState = { page: 1, perPage: 50, filters: {} };
+let registriesState = { page: 1, perPage: 50, filters: {} };
 let personsState = { page: 1, perPage: 50, filters: {} };
 let viewerState = { zoom: 1, pages: [], currentIndex: 0, manifestId: null };
 
@@ -21,6 +22,7 @@ function navigateTo(view, params) {
   switch (view) {
     case 'dashboard': loadDashboard(); break;
     case 'browse': loadBrowse(); break;
+    case 'registries': loadRegistries(); break;
     case 'manifest': loadManifest(params.id); break;
     case 'viewer': loadViewer(params.manifestId, params.pageIndex); break;
     case 'persons': loadPersons(); break;
@@ -126,6 +128,10 @@ async function loadDashboard() {
             <strong>${esc(formatNumber(stats.search_queries))}</strong> ricerche effettuate,
             <strong>${esc(formatNumber(stats.registry_results))}</strong> risultati trovati
           </p>
+        </article>
+        <article>
+          <h3>Catalogo Registri</h3>
+          <p><strong>${esc(formatNumber(stats.registries))}</strong> registri catalogati</p>
         </article>
       </div>
     `;
@@ -279,6 +285,153 @@ async function fetchBrowseResults() {
     const nextBtn = document.getElementById('browse-next');
     if (prevBtn) prevBtn.addEventListener('click', () => { browseState.page--; fetchBrowseResults(); });
     if (nextBtn) nextBtn.addEventListener('click', () => { browseState.page++; fetchBrowseResults(); });
+
+  } catch (e) {
+    el.removeAttribute('aria-busy');
+    el.textContent = `Errore: ${e.message}`;
+  }
+}
+
+// ─── Registries Catalog ──────────────────────────────────────────────────
+
+async function loadRegistries() {
+  const el = document.getElementById('view-registries');
+
+  if (!el.dataset.initialized) {
+    el.dataset.initialized = 'true';
+    setContent(el, `
+      <h2>Catalogo Registri</h2>
+      <div class="filters" id="reg-filters">
+        <div class="filter-group">
+          <label>Tipo documento</label>
+          <select id="reg-filter-doc-type"><option value="">Tutti</option></select>
+        </div>
+        <div class="filter-group">
+          <label>Anno</label>
+          <input type="text" id="reg-filter-year" placeholder="es. 1810">
+        </div>
+        <div class="filter-group">
+          <label>Archivio</label>
+          <select id="reg-filter-archive"><option value="">Tutti</option></select>
+        </div>
+        <div class="filter-group">
+          <label>Localit&agrave;</label>
+          <input type="text" id="reg-filter-locality" placeholder="es. Camposano">
+        </div>
+        <div class="filter-group">
+          <label><input type="checkbox" id="reg-filter-has-images"> Solo con immagini</label>
+        </div>
+        <div class="filter-group" style="align-self:end">
+          <button onclick="applyRegistryFilters()" class="outline">Filtra</button>
+        </div>
+      </div>
+      <div id="reg-results"></div>
+    `);
+
+    try {
+      const facets = await api('/registries/facets');
+
+      const docSel = document.getElementById('reg-filter-doc-type');
+      facets.doc_types.forEach(dt => {
+        const opt = document.createElement('option');
+        opt.value = dt;
+        opt.textContent = dt;
+        docSel.appendChild(opt);
+      });
+
+      const archSel = document.getElementById('reg-filter-archive');
+      facets.archives.forEach(a => {
+        const opt = document.createElement('option');
+        opt.value = a;
+        opt.textContent = a;
+        archSel.appendChild(opt);
+      });
+    } catch (e) {
+      // Facets may fail if no data yet
+    }
+
+    document.getElementById('reg-filter-year').addEventListener('keydown', e => {
+      if (e.key === 'Enter') applyRegistryFilters();
+    });
+    document.getElementById('reg-filter-locality').addEventListener('keydown', e => {
+      if (e.key === 'Enter') applyRegistryFilters();
+    });
+  }
+
+  applyRegistryFilters();
+}
+
+async function applyRegistryFilters() {
+  registriesState.filters = {
+    doc_type: document.getElementById('reg-filter-doc-type')?.value || '',
+    year: document.getElementById('reg-filter-year')?.value || '',
+    archive: document.getElementById('reg-filter-archive')?.value || '',
+    locality: document.getElementById('reg-filter-locality')?.value || '',
+    has_images: document.getElementById('reg-filter-has-images')?.checked || false,
+  };
+  registriesState.page = 1;
+  await fetchRegistryResults();
+}
+
+async function fetchRegistryResults() {
+  const el = document.getElementById('reg-results');
+  el.textContent = '';
+  el.setAttribute('aria-busy', 'true');
+
+  const f = registriesState.filters;
+  let qs = `?page=${registriesState.page}&per_page=${registriesState.perPage}`;
+  if (f.doc_type) qs += `&doc_type=${encodeURIComponent(f.doc_type)}`;
+  if (f.year) qs += `&year=${encodeURIComponent(f.year)}`;
+  if (f.archive) qs += `&archive=${encodeURIComponent(f.archive)}`;
+  if (f.locality) qs += `&locality=${encodeURIComponent(f.locality)}`;
+  if (f.has_images) qs += `&has_images=true`;
+
+  try {
+    const data = await api(`/registries${qs}`);
+    el.removeAttribute('aria-busy');
+
+    if (data.data.length === 0) {
+      el.textContent = 'Nessun registro trovato.';
+      return;
+    }
+
+    const totalPages = Math.ceil(data.total / data.per_page);
+
+    const rows = data.data.map(r => {
+      const arkShort = r.ark_url.split('/').pop() || r.ark_url;
+      return `<tr>
+        <td>${esc(r.year) || '-'}</td>
+        <td>${esc(r.doc_type) || '-'}</td>
+        <td>${esc(r.locality_name) || '-'}</td>
+        <td>${esc(r.province) || '-'}</td>
+        <td>${esc(r.archive_name) || '-'}</td>
+        <td>${esc(r.signature) || '-'}</td>
+        <td><a href="${esc(r.ark_url)}" target="_blank">${esc(arkShort)}</a></td>
+        <td>${r.has_images ? '\u2713' : '-'}</td>
+      </tr>`;
+    }).join('');
+
+    let paginationHtml = '';
+    if (totalPages > 1) {
+      paginationHtml = `<div class="pagination">
+        <button id="reg-prev" ${registriesState.page <= 1 ? 'disabled' : ''}>&laquo; Prec</button>
+        <span class="page-info">Pagina ${esc(String(registriesState.page))} di ${esc(String(totalPages))}</span>
+        <button id="reg-next" ${registriesState.page >= totalPages ? 'disabled' : ''}>Succ &raquo;</button>
+      </div>`;
+    }
+
+    setContent(el, `
+      <p>${esc(formatNumber(data.total))} registri trovati</p>
+      <table role="grid"><thead><tr>
+        <th>Anno</th><th>Tipo</th><th>Localit\u00e0</th><th>Provincia</th><th>Archivio</th><th>Segnatura</th><th>ARK</th><th>Immagini</th>
+      </tr></thead><tbody>${rows}</tbody></table>
+      ${paginationHtml}
+    `);
+
+    const prevBtn = document.getElementById('reg-prev');
+    const nextBtn = document.getElementById('reg-next');
+    if (prevBtn) prevBtn.addEventListener('click', () => { registriesState.page--; fetchRegistryResults(); });
+    if (nextBtn) nextBtn.addEventListener('click', () => { registriesState.page++; fetchRegistryResults(); });
 
   } catch (e) {
     el.removeAttribute('aria-busy');

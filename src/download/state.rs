@@ -6,6 +6,34 @@ use rusqlite::{params, Connection};
 use crate::models::manifest::{IiifManifest, MetadataEntry};
 use crate::models::search::{NameResult, RegistryResult};
 
+/// Extract a 4-digit year from a date string like "1810/01/01" or "1810".
+fn extract_year(date: &str) -> Option<String> {
+    // Look for a 4-digit year at the start of the string
+    let trimmed = date.trim();
+    if trimmed.len() >= 4 && trimmed[..4].chars().all(|c| c.is_ascii_digit()) {
+        Some(trimmed[..4].to_string())
+    } else {
+        None
+    }
+}
+
+/// Parse a context string like "Stato civile napoleonico > Camposano (provincia di Napoli)"
+/// into (locality_name, province).
+fn parse_context_locality(context: &str) -> (Option<String>, Option<String>) {
+    let locality_part = match context.rsplit(" > ").next() {
+        Some(s) if !s.is_empty() => s,
+        _ => return (None, None),
+    };
+
+    if let Some(idx) = locality_part.find("(provincia di ") {
+        let name = locality_part[..idx].trim().to_string();
+        let prov = locality_part[idx + 14..].trim_end_matches(')').trim().to_string();
+        (Some(name), Some(prov))
+    } else {
+        (Some(locality_part.trim().to_string()), None)
+    }
+}
+
 /// SQLite-backed state database for tracking downloads, manifests, sessions, tags,
 /// search results, persons, and archives.
 pub struct StateDb {
@@ -130,6 +158,9 @@ impl StateDb {
 
         if current < 2 {
             self.migrate_v2()?;
+        }
+        if current < 3 {
+            self.migrate_v3()?;
         }
 
         Ok(())
@@ -321,6 +352,55 @@ impl StateDb {
             self.conn.execute(
                 "INSERT INTO schema_version (version) VALUES (?1)",
                 params![2],
+            )?;
+
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT;")?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                Err(e)
+            }
+        }
+    }
+
+    fn migrate_v3(&self) -> Result<()> {
+        self.conn.execute_batch("BEGIN TRANSACTION;")?;
+
+        let result = (|| -> Result<()> {
+            self.conn.execute_batch(
+                "
+                CREATE TABLE IF NOT EXISTS registries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ark_url TEXT NOT NULL UNIQUE,
+                    year TEXT,
+                    doc_type TEXT,
+                    signature TEXT,
+                    context TEXT,
+                    archive_name TEXT,
+                    archive_url TEXT,
+                    archive_db_id INTEGER REFERENCES archives(id),
+                    locality_name TEXT,
+                    province TEXT,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_registries_ark ON registries(ark_url);
+                CREATE INDEX IF NOT EXISTS idx_registries_year ON registries(year);
+                CREATE INDEX IF NOT EXISTS idx_registries_doc_type ON registries(doc_type);
+                CREATE INDEX IF NOT EXISTS idx_registries_archive ON registries(archive_db_id);
+                "
+            )?;
+
+            self.conn.execute(
+                "INSERT INTO schema_version (version) VALUES (?1)",
+                params![3],
             )?;
 
             Ok(())
@@ -654,6 +734,221 @@ impl StateDb {
             params![manifest_id, ark_url],
         )?;
         Ok(())
+    }
+
+    // ─── Registry Catalog Methods ────────────────────────────────────────
+
+    /// Upsert a single registry into the persistent catalog.
+    pub fn upsert_registry(&self, result: &RegistryResult) -> Result<i64> {
+        let (locality_name, province) = parse_context_locality(&result.context);
+
+        // Upsert archive if we have a name
+        let archive_db_id = if !result.archive.is_empty() {
+            let slug = result.archive.to_lowercase()
+                .replace(' ', "-")
+                .replace('\'', "");
+            Some(self.upsert_archive(&result.archive, &slug, result.archive_url.as_deref())?)
+        } else {
+            None
+        };
+
+        self.conn.execute(
+            "INSERT INTO registries (ark_url, year, doc_type, signature, context,
+                archive_name, archive_url, archive_db_id, locality_name, province)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(ark_url) DO UPDATE SET
+                year = excluded.year,
+                doc_type = excluded.doc_type,
+                signature = excluded.signature,
+                context = excluded.context,
+                archive_name = excluded.archive_name,
+                archive_url = excluded.archive_url,
+                archive_db_id = excluded.archive_db_id,
+                locality_name = excluded.locality_name,
+                province = excluded.province,
+                updated_at = datetime('now')",
+            params![
+                result.ark_url, result.year, result.doc_type, result.signature,
+                result.context, result.archive, result.archive_url,
+                archive_db_id, locality_name, province,
+            ],
+        )?;
+
+        let id: i64 = self.conn.query_row(
+            "SELECT id FROM registries WHERE ark_url = ?1",
+            params![result.ark_url],
+            |row| row.get(0),
+        )?;
+        Ok(id)
+    }
+
+    /// Upsert a batch of registries in a single transaction.
+    pub fn upsert_registries_batch(&self, results: &[RegistryResult]) -> Result<usize> {
+        self.conn.execute_batch("BEGIN TRANSACTION;")?;
+        let mut count = 0;
+        let result = (|| -> Result<usize> {
+            for r in results {
+                self.upsert_registry(r)?;
+                count += 1;
+            }
+            Ok(count)
+        })();
+        match result {
+            Ok(n) => {
+                self.conn.execute_batch("COMMIT;")?;
+                Ok(n)
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                Err(e)
+            }
+        }
+    }
+
+    /// Create a registry catalog entry from an IIIF manifest's metadata.
+    /// Used when downloading a single manifest directly (not via search).
+    pub fn upsert_registry_from_manifest(
+        &self,
+        manifest: &IiifManifest,
+        ark_url: Option<&str>,
+    ) -> Result<()> {
+        let Some(ark) = ark_url else { return Ok(()) };
+
+        let archive_name = manifest.get_metadata("Conservato da").unwrap_or_default();
+        let context = manifest.archival_context().unwrap_or_default();
+        let doc_type = manifest.doc_type().unwrap_or_default();
+        let signature = manifest.get_metadata("Segnatura attuale").unwrap_or_default();
+        let date_from = manifest.get_metadata("Estremo remoto")
+            .or_else(|| manifest.get_metadata("Datazione"))
+            .unwrap_or_default();
+        // Extract just the 4-digit year from dates like "1810/01/01"
+        let year = extract_year(date_from);
+
+        let result = RegistryResult {
+            ark_url: ark.to_string(),
+            year: year.unwrap_or_else(|| date_from.to_string()),
+            doc_type: doc_type.to_string(),
+            signature: signature.to_string(),
+            context: context.to_string(),
+            archive: archive_name.to_string(),
+            archive_url: None,
+        };
+
+        self.upsert_registry(&result)?;
+        Ok(())
+    }
+
+    /// Search the persistent registries catalog with pagination and optional has_images filter.
+    pub fn search_registries_catalog(
+        &self,
+        doc_type: Option<&str>,
+        year: Option<&str>,
+        archive_name: Option<&str>,
+        locality: Option<&str>,
+        has_images: Option<bool>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<(Vec<RegistryCatalogRecord>, usize)> {
+        let mut where_clause = "WHERE 1=1".to_string();
+        let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+        if let Some(dt) = doc_type {
+            where_clause.push_str(&format!(" AND r.doc_type = ?{}", params_vec.len() + 1));
+            params_vec.push(Box::new(dt.to_string()));
+        }
+        if let Some(y) = year {
+            where_clause.push_str(&format!(" AND r.year LIKE ?{}", params_vec.len() + 1));
+            params_vec.push(Box::new(format!("%{y}%")));
+        }
+        if let Some(an) = archive_name {
+            where_clause.push_str(&format!(" AND r.archive_name LIKE ?{}", params_vec.len() + 1));
+            params_vec.push(Box::new(format!("%{an}%")));
+        }
+        if let Some(loc) = locality {
+            where_clause.push_str(&format!(" AND (r.locality_name LIKE ?{0} OR r.context LIKE ?{0})", params_vec.len() + 1));
+            params_vec.push(Box::new(format!("%{loc}%")));
+        }
+        if let Some(true) = has_images {
+            where_clause.push_str(
+                " AND EXISTS (SELECT 1 FROM manifests m JOIN downloads d ON d.manifest_id = m.id \
+                 WHERE m.ark_url = r.ark_url AND d.status = 'complete')"
+            );
+        }
+        if let Some(false) = has_images {
+            where_clause.push_str(
+                " AND NOT EXISTS (SELECT 1 FROM manifests m JOIN downloads d ON d.manifest_id = m.id \
+                 WHERE m.ark_url = r.ark_url AND d.status = 'complete')"
+            );
+        }
+
+        // Count query
+        let count_sql = format!("SELECT COUNT(*) FROM registries r {where_clause}");
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+        let total: i64 = self.conn.query_row(&count_sql, params_refs.as_slice(), |row| row.get(0))?;
+
+        // Data query
+        let data_sql = format!(
+            "SELECT r.id, r.ark_url, r.year, r.doc_type, r.signature, r.context,
+                    r.archive_name, r.locality_name, r.province, r.updated_at,
+                    EXISTS (SELECT 1 FROM manifests m JOIN downloads d ON d.manifest_id = m.id
+                            WHERE m.ark_url = r.ark_url AND d.status = 'complete') as has_images
+             FROM registries r
+             {where_clause}
+             ORDER BY r.year, r.doc_type
+             LIMIT ?{} OFFSET ?{}",
+            params_vec.len() + 1,
+            params_vec.len() + 2,
+        );
+        params_vec.push(Box::new(limit as i64));
+        params_vec.push(Box::new(offset as i64));
+
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+        let mut stmt = self.conn.prepare(&data_sql)?;
+        let records = stmt
+            .query_map(params_refs.as_slice(), |row| {
+                Ok(RegistryCatalogRecord {
+                    id: row.get(0)?,
+                    ark_url: row.get(1)?,
+                    year: row.get(2)?,
+                    doc_type: row.get(3)?,
+                    signature: row.get(4)?,
+                    context: row.get(5)?,
+                    archive_name: row.get(6)?,
+                    locality_name: row.get(7)?,
+                    province: row.get(8)?,
+                    updated_at: row.get(9)?,
+                    has_images: row.get(10)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok((records, total as usize))
+    }
+
+    /// Get facets (distinct values) from the registries catalog.
+    pub fn get_registry_facets(&self) -> Result<RegistryFacets> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT doc_type FROM registries WHERE doc_type IS NOT NULL ORDER BY doc_type",
+        )?;
+        let doc_types = stmt
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<String>, _>>()?;
+
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT year FROM registries WHERE year IS NOT NULL ORDER BY year",
+        )?;
+        let years = stmt
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<String>, _>>()?;
+
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT archive_name FROM registries WHERE archive_name IS NOT NULL ORDER BY archive_name",
+        )?;
+        let archives = stmt
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<String>, _>>()?;
+
+        Ok(RegistryFacets { doc_types, years, archives })
     }
 
     /// Search cached registry results locally.
@@ -1270,6 +1565,9 @@ impl StateDb {
         let localities: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM localities", [], |row| row.get(0),
         )?;
+        let registries: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM registries", [], |row| row.get(0),
+        )?;
 
         Ok(ExtendedStats {
             base,
@@ -1278,6 +1576,7 @@ impl StateDb {
             persons: persons as usize,
             search_queries: search_queries as usize,
             registry_results: registry_results as usize,
+            registries: registries as usize,
             ocr_results: ocr_results as usize,
         })
     }
@@ -1628,6 +1927,7 @@ pub struct ExtendedStats {
     pub persons: usize,
     pub search_queries: usize,
     pub registry_results: usize,
+    pub registries: usize,
     pub ocr_results: usize,
 }
 
@@ -1674,6 +1974,28 @@ pub struct RegistryResultRecord {
     pub archive_name: Option<String>,
     pub archive_url: Option<String>,
     pub manifest_id: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RegistryCatalogRecord {
+    pub id: i64,
+    pub ark_url: String,
+    pub year: Option<String>,
+    pub doc_type: Option<String>,
+    pub signature: Option<String>,
+    pub context: Option<String>,
+    pub archive_name: Option<String>,
+    pub locality_name: Option<String>,
+    pub province: Option<String>,
+    pub has_images: bool,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RegistryFacets {
+    pub doc_types: Vec<String>,
+    pub years: Vec<String>,
+    pub archives: Vec<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1935,5 +2257,207 @@ mod tests {
 
         let results = db.search_manifests(None, None, Some("Napoli"), None).unwrap();
         assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn test_extract_year() {
+        assert_eq!(extract_year("1810/01/01"), Some("1810".to_string()));
+        assert_eq!(extract_year("1810"), Some("1810".to_string()));
+        assert_eq!(extract_year("  1810/12/31 "), Some("1810".to_string()));
+        assert_eq!(extract_year("Registro 37.1"), None);
+        assert_eq!(extract_year(""), None);
+    }
+
+    #[test]
+    fn test_parse_context_locality() {
+        let (loc, prov) = parse_context_locality("Stato civile napoleonico > Camposano (provincia di Napoli)");
+        assert_eq!(loc, Some("Camposano".to_string()));
+        assert_eq!(prov, Some("Napoli".to_string()));
+
+        let (loc, prov) = parse_context_locality("Stato civile > Roma");
+        assert_eq!(loc, Some("Roma".to_string()));
+        assert_eq!(prov, None);
+
+        let (loc, prov) = parse_context_locality("");
+        assert_eq!(loc, None);
+        assert_eq!(prov, None);
+
+        let (loc, prov) = parse_context_locality("SinglePart");
+        assert_eq!(loc, Some("SinglePart".to_string()));
+        assert_eq!(prov, None);
+    }
+
+    #[test]
+    fn test_upsert_registry() {
+        let db = StateDb::in_memory().unwrap();
+
+        let result = RegistryResult {
+            ark_url: "https://antenati.cultura.gov.it/ark:/12657/an_ua18771".to_string(),
+            year: "1810".to_string(),
+            doc_type: "Nati".to_string(),
+            signature: "82.1422".to_string(),
+            context: "Stato civile napoleonico > Camposano (provincia di Napoli)".to_string(),
+            archive: "Archivio di Stato di Napoli".to_string(),
+            archive_url: Some("https://antenati.cultura.gov.it/archivio/archivio-di-stato-di-napoli".to_string()),
+        };
+
+        let id1 = db.upsert_registry(&result).unwrap();
+        assert!(id1 > 0);
+
+        // Upsert same ark_url should return same id
+        let id2 = db.upsert_registry(&result).unwrap();
+        assert_eq!(id1, id2);
+
+        // Update with different data
+        let result2 = RegistryResult {
+            year: "1811".to_string(),
+            ..result.clone()
+        };
+        let id3 = db.upsert_registry(&result2).unwrap();
+        assert_eq!(id1, id3);
+
+        // Verify the data was updated
+        let (records, total) = db.search_registries_catalog(None, None, None, None, None, 0, 50).unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(records[0].year, Some("1811".to_string()));
+        assert_eq!(records[0].locality_name, Some("Camposano".to_string()));
+        assert_eq!(records[0].province, Some("Napoli".to_string()));
+
+        // Verify archive was also created
+        let archives = db.list_archives().unwrap();
+        assert_eq!(archives.len(), 1);
+        assert_eq!(archives[0].name, "Archivio di Stato di Napoli");
+    }
+
+    #[test]
+    fn test_registries_batch() {
+        let db = StateDb::in_memory().unwrap();
+
+        let results = vec![
+            RegistryResult {
+                ark_url: "ark:/12657/an_ua001".to_string(),
+                year: "1810".to_string(),
+                doc_type: "Nati".to_string(),
+                signature: "1.1".to_string(),
+                context: "Civile > Napoli (provincia di Napoli)".to_string(),
+                archive: "Archivio Napoli".to_string(),
+                archive_url: None,
+            },
+            RegistryResult {
+                ark_url: "ark:/12657/an_ua002".to_string(),
+                year: "1820".to_string(),
+                doc_type: "Morti".to_string(),
+                signature: "2.1".to_string(),
+                context: "Civile > Roma".to_string(),
+                archive: "Archivio Roma".to_string(),
+                archive_url: None,
+            },
+        ];
+
+        let count = db.upsert_registries_batch(&results).unwrap();
+        assert_eq!(count, 2);
+
+        let (records, total) = db.search_registries_catalog(None, None, None, None, None, 0, 50).unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(records.len(), 2);
+    }
+
+    #[test]
+    fn test_registries_has_images_filter() {
+        let db = StateDb::in_memory().unwrap();
+
+        let result = RegistryResult {
+            ark_url: "ark:/12657/an_ua100".to_string(),
+            year: "1810".to_string(),
+            doc_type: "Nati".to_string(),
+            signature: "1.1".to_string(),
+            context: "Civile > Camposano (provincia di Napoli)".to_string(),
+            archive: "Archivio".to_string(),
+            archive_url: None,
+        };
+        db.upsert_registry(&result).unwrap();
+
+        // No images yet
+        let (records, _) = db.search_registries_catalog(None, None, None, None, Some(true), 0, 50).unwrap();
+        assert_eq!(records.len(), 0);
+        let (records, _) = db.search_registries_catalog(None, None, None, None, Some(false), 0, 50).unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(!records[0].has_images);
+
+        // Add a manifest with same ark_url and a complete download
+        db.upsert_manifest("m1", "ctx", Some("Test"), 10, None).unwrap();
+        // Set the ark_url on the manifest
+        db.conn.execute(
+            "UPDATE manifests SET ark_url = ?1 WHERE id = ?2",
+            params!["ark:/12657/an_ua100", "m1"],
+        ).unwrap();
+        db.insert_download("m1", "c1", 0, "http://example.com/img.jpg").unwrap();
+        db.mark_complete("m1", "c1", "/tmp/img.jpg", "abc123").unwrap();
+
+        // Now should have images
+        let (records, _) = db.search_registries_catalog(None, None, None, None, Some(true), 0, 50).unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(records[0].has_images);
+
+        let (records, _) = db.search_registries_catalog(None, None, None, None, Some(false), 0, 50).unwrap();
+        assert_eq!(records.len(), 0);
+    }
+
+    #[test]
+    fn test_registries_pagination() {
+        let db = StateDb::in_memory().unwrap();
+
+        for i in 0..10 {
+            let result = RegistryResult {
+                ark_url: format!("ark:/12657/an_ua{i:03}"),
+                year: format!("{}", 1800 + i),
+                doc_type: "Nati".to_string(),
+                signature: format!("{i}.1"),
+                context: "Civile > Napoli".to_string(),
+                archive: "Archivio".to_string(),
+                archive_url: None,
+            };
+            db.upsert_registry(&result).unwrap();
+        }
+
+        let (records, total) = db.search_registries_catalog(None, None, None, None, None, 0, 3).unwrap();
+        assert_eq!(total, 10);
+        assert_eq!(records.len(), 3);
+
+        let (records, total) = db.search_registries_catalog(None, None, None, None, None, 9, 3).unwrap();
+        assert_eq!(total, 10);
+        assert_eq!(records.len(), 1);
+    }
+
+    #[test]
+    fn test_registry_facets() {
+        let db = StateDb::in_memory().unwrap();
+
+        let results = vec![
+            RegistryResult {
+                ark_url: "ark:/12657/an_ua001".to_string(),
+                year: "1810".to_string(),
+                doc_type: "Nati".to_string(),
+                signature: "1.1".to_string(),
+                context: "Civile > Napoli".to_string(),
+                archive: "Archivio Napoli".to_string(),
+                archive_url: None,
+            },
+            RegistryResult {
+                ark_url: "ark:/12657/an_ua002".to_string(),
+                year: "1820".to_string(),
+                doc_type: "Morti".to_string(),
+                signature: "2.1".to_string(),
+                context: "Civile > Roma".to_string(),
+                archive: "Archivio Roma".to_string(),
+                archive_url: None,
+            },
+        ];
+        db.upsert_registries_batch(&results).unwrap();
+
+        let facets = db.get_registry_facets().unwrap();
+        assert_eq!(facets.doc_types, vec!["Morti", "Nati"]);
+        assert_eq!(facets.years, vec!["1810", "1820"]);
+        assert_eq!(facets.archives, vec!["Archivio Napoli", "Archivio Roma"]);
     }
 }

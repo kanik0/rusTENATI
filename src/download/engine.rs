@@ -68,6 +68,7 @@ pub async fn download_manifest(
     manifest: &IiifManifest,
     output_dir: &Path,
     config: &DownloadConfig,
+    ark_url: Option<&str>,
 ) -> Result<DownloadSummary> {
     // Filter canvases by page range
     let canvases: Vec<(usize, &Canvas)> = manifest
@@ -111,7 +112,7 @@ pub async fn download_manifest(
     output::write_metadata_json(output_dir, manifest, &chrono::Utc::now().to_rfc3339())?;
 
     // Register manifest with full metadata and downloads in state DB
-    state_db.store_manifest_from_iiif(manifest, None)?;
+    state_db.store_manifest_from_iiif(manifest, ark_url)?;
 
     for (i, canvas) in &canvases {
         let url = canvas.full_image_url(&config.image_format);

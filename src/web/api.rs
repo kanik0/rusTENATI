@@ -24,6 +24,8 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/facets/years", get(get_facet_years))
         .route("/downloads/{id}/ocr", get(get_download_ocr))
         .route("/downloads/{id}/tags", get(get_download_tags))
+        .route("/registries", get(get_registries))
+        .route("/registries/facets", get(get_registry_facets))
 }
 
 // ─── Query parameter structs ─────────────────────────────────────────────
@@ -55,6 +57,17 @@ struct PersonQuery {
 struct OcrQuery {
     q: String,
     limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct RegistryQuery {
+    doc_type: Option<String>,
+    year: Option<String>,
+    archive: Option<String>,
+    locality: Option<String>,
+    has_images: Option<bool>,
+    page: Option<usize>,
+    per_page: Option<usize>,
 }
 
 // ─── Response wrappers ───────────────────────────────────────────────────
@@ -242,6 +255,37 @@ async fn get_download_tags(
     let db = state.db.lock().unwrap();
     match db.get_tags_for_download(id) {
         Ok(tags) => Json(tags).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+async fn get_registries(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<RegistryQuery>,
+) -> impl IntoResponse {
+    let db = state.db.lock().unwrap();
+    let page = params.page.unwrap_or(1).max(1);
+    let per_page = params.per_page.unwrap_or(50).min(200);
+    let offset = (page - 1) * per_page;
+
+    match db.search_registries_catalog(
+        params.doc_type.as_deref(),
+        params.year.as_deref(),
+        params.archive.as_deref(),
+        params.locality.as_deref(),
+        params.has_images,
+        offset,
+        per_page,
+    ) {
+        Ok((data, total)) => Json(PaginatedResponse { data, total, page, per_page }).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+async fn get_registry_facets(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let db = state.db.lock().unwrap();
+    match db.get_registry_facets() {
+        Ok(facets) => Json(facets).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
