@@ -330,7 +330,7 @@ async function loadManifest(id) {
     if (completedPages.length > 0) {
       const thumbCards = pages.map((p, idx) => {
         if (p.status !== 'complete' || !p.local_path) return '';
-        const imgSrc = `/images/${encodeURI(p.local_path)}`;
+        const imgSrc = `/images/${encodeURI(p.local_path.replace(/^\.?\/?antenati\//, ''))}`;
         return `<div class="thumb-card" data-page-index="${idx}">
           <img src="${esc(imgSrc)}" alt="${esc(p.canvas_label)}" loading="lazy">
           <div class="thumb-label">${esc(p.canvas_label) || `Pag. ${p.canvas_index + 1}`}</div>
@@ -394,7 +394,7 @@ async function renderViewer(el) {
     return;
   }
 
-  const imgSrc = page.local_path ? `/images/${encodeURI(page.local_path)}` : '';
+  const imgSrc = page.local_path ? `/images/${encodeURI(page.local_path.replace(/^\.?\/?antenati\//, ''))}` : '';
   const label = page.canvas_label || `Pagina ${page.canvas_index + 1}`;
   const total = viewerState.pages.length;
   const idx = viewerState.currentIndex;
