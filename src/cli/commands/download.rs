@@ -433,16 +433,14 @@ async fn run_noah_mode(
     let total_archives = archives.len();
     eprintln!("Found {total_archives} archives to process.");
 
-    if args.dry_run {
-        println!("Dry run: would process {} archives:", total_archives);
-        for (i, archive) in archives.iter().enumerate() {
-            println!("  {:3}. {}", i + 1, archive.name);
-        }
-        return Ok(());
-    }
-
     let state_db_path = output::db_path();
     let state_db = StateDb::open(&state_db_path)?;
+
+    // Persist archives to catalog
+    for a in &archives {
+        state_db.upsert_archive(&a.name, &a.slug, Some(&a.url))?;
+    }
+
     let limiter = rate_limiter::create_rate_limiter(effective_rps(args));
 
     let page_range = args
@@ -534,6 +532,32 @@ async fn run_noah_mode(
         state_db.upsert_registries_batch(&all_results)?;
 
         let archive_registries = all_results.len();
+
+        // Dry run: list registries and skip download
+        if args.dry_run {
+            println!(
+                "Dry run: {} registries in {}:",
+                archive_registries, archive.name
+            );
+            for (reg_idx, result) in all_results.iter().enumerate() {
+                let loc = result
+                    .context
+                    .rsplit(" > ")
+                    .next()
+                    .unwrap_or(&result.context)
+                    .trim();
+                println!(
+                    "  {:3}. {} - {} - {} [{}]",
+                    reg_idx + 1,
+                    result.year,
+                    result.doc_type,
+                    loc,
+                    result.ark_url,
+                );
+            }
+            total_registries_processed += archive_registries;
+            continue;
+        }
 
         // Download each registry
         for (reg_idx, result) in all_results.iter().enumerate() {
