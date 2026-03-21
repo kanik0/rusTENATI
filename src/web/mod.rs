@@ -29,7 +29,7 @@ pub async fn start_server(
 
     let app = Router::new()
         .nest("/api/v1", api::routes())
-        .nest_service("/images/antenati", ServeDir::new(&data_dir))
+        .nest_service("/images", ServeDir::new(&data_dir))
         .fallback(assets::static_handler)
         .with_state(state);
 
