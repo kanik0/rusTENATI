@@ -111,10 +111,12 @@ impl AntenatiClient {
                 break;
             }
 
-            // Calculate wait time
+            // Calculate wait time with graduated Retry-After cap:
+            // attempt 1 → cap 60s, attempt 2 → 120s, attempt 3 → 240s, ...
+            let retry_after_cap_ms = 60_000u64 * (1 << (attempt - 1));
             let wait_ms = if let Some(ra) = retry_after {
-                // Respect Retry-After if it's larger than our backoff
-                (ra * 1000).max(backoff_ms)
+                // Respect Retry-After, but cap to graduated maximum
+                (ra * 1000).min(retry_after_cap_ms).max(backoff_ms)
             } else if status_code == 429 {
                 // Default 429 wait: use backoff * 2
                 backoff_ms * 2
