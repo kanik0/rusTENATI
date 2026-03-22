@@ -1,6 +1,7 @@
 use std::io::Write;
 
 use anyhow::Result;
+use chrono::Utc;
 use clap::Args;
 
 use crate::download::state::StateDb;
@@ -8,11 +9,11 @@ use crate::output;
 
 #[derive(Debug, Args)]
 pub struct ExportArgs {
-    /// Export format: csv, json
+    /// Export format: csv, json, gedcom
     #[arg(short, long, default_value = "csv")]
     pub format: String,
 
-    /// What to export: manifests, downloads, tags, persons, registries
+    /// What to export: manifests, downloads, tags, persons, registries, gedcom
     pub what: String,
 
     /// Output file (default: stdout)
@@ -47,7 +48,8 @@ pub fn run(args: &ExportArgs) -> Result<()> {
         "tags" => export_tags(&state_db, args, &mut writer),
         "persons" => export_persons(&state_db, args, &mut writer),
         "registries" => export_registries(&state_db, args, &mut writer),
-        other => anyhow::bail!("Unknown export type: '{other}'. Use: manifests, downloads, tags, persons, registries"),
+        "gedcom" => export_gedcom(&state_db, &mut writer),
+        other => anyhow::bail!("Unknown export type: '{other}'. Use: manifests, downloads, tags, persons, registries, gedcom"),
     }
 }
 
@@ -185,6 +187,134 @@ fn export_registries(db: &StateDb, args: &ExportArgs, w: &mut dyn Write) -> Resu
         f => anyhow::bail!("Unsupported format: {f}"),
     }
     Ok(())
+}
+
+/// Export all persons and their linked records as GEDCOM 5.5.1 format.
+/// GEDCOM is the universal standard for genealogy software (FamilySearch, Ancestry, MyHeritage, Gramps).
+fn export_gedcom(db: &StateDb, w: &mut dyn Write) -> Result<()> {
+    let persons = db.get_all_persons_full()?;
+
+    if persons.is_empty() {
+        anyhow::bail!("No persons found in database. Run name searches first to populate person records.");
+    }
+
+    // GEDCOM Header
+    writeln!(w, "0 HEAD")?;
+    writeln!(w, "1 SOUR RUSTENATI")?;
+    writeln!(w, "2 VERS {}", env!("CARGO_PKG_VERSION"))?;
+    writeln!(w, "2 NAME Rustenati")?;
+    writeln!(w, "2 CORP Portale Antenati Dumper")?;
+    writeln!(w, "1 DEST ANY")?;
+    writeln!(w, "1 DATE {}", Utc::now().format("%d %b %Y").to_string().to_uppercase())?;
+    writeln!(w, "1 SUBM @SUBM1@")?;
+    writeln!(w, "1 GEDC")?;
+    writeln!(w, "2 VERS 5.5.1")?;
+    writeln!(w, "2 FORM LINEAGE-LINKED")?;
+    writeln!(w, "1 CHAR UTF-8")?;
+    writeln!(w, "1 LANG Italian")?;
+
+    // Submitter record
+    writeln!(w, "0 @SUBM1@ SUBM")?;
+    writeln!(w, "1 NAME Rustenati User")?;
+
+    // Individual records
+    for person in &persons {
+        let indi_id = format!("@I{}@", person.id);
+        writeln!(w, "0 {} INDI", indi_id)?;
+
+        // Name
+        let surname = person.surname.as_deref().unwrap_or("");
+        let given = person.given_name.as_deref().unwrap_or("");
+        if !surname.is_empty() || !given.is_empty() {
+            writeln!(w, "1 NAME {} /{}/", given, surname)?;
+            if !surname.is_empty() {
+                writeln!(w, "2 SURN {}", surname)?;
+            }
+            if !given.is_empty() {
+                writeln!(w, "2 GIVN {}", given)?;
+            }
+        }
+
+        // Birth event
+        if person.birth_year.is_some() || person.birth_place.is_some() || person.birth_info.is_some() {
+            writeln!(w, "1 BIRT")?;
+            if let Some(year) = person.birth_year {
+                writeln!(w, "2 DATE {}", year)?;
+            }
+            if let Some(ref place) = person.birth_place {
+                if !place.is_empty() {
+                    writeln!(w, "2 PLAC {}", place)?;
+                }
+            }
+            if let Some(ref info) = person.birth_info {
+                if !info.is_empty() {
+                    writeln!(w, "2 NOTE {}", gedcom_escape(info))?;
+                }
+            }
+        }
+
+        // Death event
+        if person.death_year.is_some() || person.death_place.is_some() || person.death_info.is_some() {
+            writeln!(w, "1 DEAT")?;
+            if let Some(year) = person.death_year {
+                writeln!(w, "2 DATE {}", year)?;
+            }
+            if let Some(ref place) = person.death_place {
+                if !place.is_empty() {
+                    writeln!(w, "2 PLAC {}", place)?;
+                }
+            }
+            if let Some(ref info) = person.death_info {
+                if !info.is_empty() {
+                    writeln!(w, "2 NOTE {}", gedcom_escape(info))?;
+                }
+            }
+        }
+
+        // Source citations from linked records
+        let records = db.get_person_records(person.id)?;
+        for record in &records {
+            if let Some(ref ark) = record.ark_url {
+                writeln!(w, "1 SOUR @S_ANTENATI@")?;
+                writeln!(w, "2 PAGE {}", ark)?;
+                if let Some(ref date) = record.date {
+                    writeln!(w, "2 DATA")?;
+                    writeln!(w, "3 DATE {}", date)?;
+                }
+                if let Some(ref rtype) = record.record_type {
+                    writeln!(w, "2 NOTE Record type: {}", rtype)?;
+                }
+            }
+        }
+
+        // Link to Portale Antenati detail page
+        if let Some(ref url) = person.detail_url {
+            writeln!(w, "1 NOTE Portale Antenati: {}", url)?;
+        }
+    }
+
+    // Source record for Portale Antenati
+    writeln!(w, "0 @S_ANTENATI@ SOUR")?;
+    writeln!(w, "1 TITL Portale Antenati - Gli Archivi per la ricerca anagrafica")?;
+    writeln!(w, "1 AUTH Ministero della Cultura, Italia")?;
+    writeln!(w, "1 PUBL https://antenati.cultura.gov.it/")?;
+    writeln!(w, "1 REPO @R_ANTENATI@")?;
+
+    // Repository record
+    writeln!(w, "0 @R_ANTENATI@ REPO")?;
+    writeln!(w, "1 NAME Portale Antenati")?;
+    writeln!(w, "1 ADDR https://antenati.cultura.gov.it/")?;
+
+    // Trailer
+    writeln!(w, "0 TRLR")?;
+
+    eprintln!("Exported {} persons to GEDCOM 5.5.1 format", persons.len());
+    Ok(())
+}
+
+/// Escape text for GEDCOM (line breaks become CONT records).
+fn gedcom_escape(s: &str) -> String {
+    s.replace('\n', " ").replace('\r', "")
 }
 
 fn csv_escape(s: &str) -> String {

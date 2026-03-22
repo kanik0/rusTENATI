@@ -183,4 +183,52 @@ impl Config {
         let config = Self::default();
         toml::to_string_pretty(&config).context("Failed to serialize default config")
     }
+
+    /// Validate configuration values. Returns warnings for non-fatal issues.
+    pub fn validate(&self) -> Result<Vec<String>> {
+        let mut warnings = Vec::new();
+
+        // Download config validation
+        if self.download.concurrency == 0 {
+            anyhow::bail!("download.concurrency must be > 0");
+        }
+        if self.download.concurrency > 64 {
+            warnings.push(format!(
+                "download.concurrency={} is very high; may trigger rate limiting",
+                self.download.concurrency
+            ));
+        }
+
+        let valid_formats = ["jpg", "png"];
+        if !valid_formats.contains(&self.download.format.as_str()) {
+            anyhow::bail!(
+                "download.format='{}' is invalid. Use: {}",
+                self.download.format,
+                valid_formats.join(", ")
+            );
+        }
+
+        // HTTP config validation
+        if self.http.timeout_secs == 0 {
+            anyhow::bail!("http.timeout_secs must be > 0");
+        }
+        if self.http.pool_max_idle_per_host == 0 {
+            warnings.push("http.pool_max_idle_per_host=0 disables connection pooling".to_string());
+        }
+
+        // OCR config validation
+        let valid_backends = ["claude", "transkribus", "azure", "google"];
+        if !valid_backends.contains(&self.ocr.default_backend.as_str()) {
+            warnings.push(format!(
+                "ocr.default_backend='{}' is not a known backend. Known: {}",
+                self.ocr.default_backend,
+                valid_backends.join(", ")
+            ));
+        }
+        if self.ocr.concurrency == 0 {
+            anyhow::bail!("ocr.concurrency must be > 0");
+        }
+
+        Ok(warnings)
+    }
 }

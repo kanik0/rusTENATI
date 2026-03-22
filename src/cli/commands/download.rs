@@ -6,7 +6,7 @@ use futures_util::future;
 use futures_util::stream::{self, StreamExt};
 
 use crate::client::antenati::AntenatiClient;
-use crate::client::rate_limiter;
+use crate::client::per_host_limiter::PerHostLimiter;
 use crate::download::engine::{self, DownloadConfig, DownloadSummary, PageRange};
 use crate::download::state::StateDb;
 use crate::models::search::RegistrySearchParams;
@@ -107,6 +107,22 @@ pub struct DownloadArgs {
     /// Enable adaptive concurrency (AIMD: auto-adjusts parallelism based on server response)
     #[arg(long)]
     pub adaptive: bool,
+
+    /// Skip confirmation prompt for batch/Noah downloads
+    #[arg(short, long)]
+    pub yes: bool,
+
+    /// Only show the count of matching registries, don't download
+    #[arg(long)]
+    pub count: bool,
+
+    /// Randomly sample N registries from the results
+    #[arg(long)]
+    pub sample: Option<usize>,
+
+    /// Sort batch results: year, doc_type, archive
+    #[arg(long)]
+    pub sort_by: Option<String>,
 }
 
 pub async fn run(
@@ -170,7 +186,7 @@ async fn run_single_download(
         }
     }
 
-    let limiter = rate_limiter::create_rate_limiter(effective_rps(args));
+    let limiter = PerHostLimiter::new(effective_rps(args));
 
     let page_range = args
         .pages
@@ -306,12 +322,67 @@ async fn run_batch_download(
         all_results.truncate(args.max_registries);
     }
 
+    // Sort results
+    if let Some(ref sort_by) = args.sort_by {
+        match sort_by.as_str() {
+            "year" => all_results.sort_by(|a, b| a.year.cmp(&b.year)),
+            "doc_type" => all_results.sort_by(|a, b| a.doc_type.cmp(&b.doc_type)),
+            "archive" => all_results.sort_by(|a, b| a.context.cmp(&b.context)),
+            other => eprintln!("Warning: unknown sort field '{other}', ignoring. Use: year, doc_type, archive"),
+        }
+    }
+
+    // Random sample
+    if let Some(n) = args.sample {
+        if n < all_results.len() {
+            // Fisher-Yates shuffle on first n elements
+            for i in 0..n.min(all_results.len()) {
+                let j = i + (fastrand::usize(0..all_results.len() - i));
+                all_results.swap(i, j);
+            }
+            all_results.truncate(n);
+        }
+    }
+
     let total_registries = all_results.len();
+
+    // Count-only mode
+    if args.count {
+        if json_output {
+            println!("{}", serde_json::json!({"count": total_registries}));
+        } else {
+            println!("{total_registries}");
+        }
+        return Ok(());
+    }
+
     eprintln!("Found {total_registries} registries to download.");
 
     if total_registries == 0 {
         eprintln!("No registries found.");
         return Ok(());
+    }
+
+    // Batch preview and confirmation
+    if !args.yes && !args.dry_run && total_registries > 1 {
+        eprintln!("\nBatch download preview:");
+        let preview_count = total_registries.min(10);
+        for (i, r) in all_results.iter().take(preview_count).enumerate() {
+            let loc = r.context.rsplit(" > ").next().unwrap_or(&r.context).trim();
+            eprintln!("  {:3}. {} - {} - {}", i + 1, r.year, r.doc_type, loc);
+        }
+        if total_registries > preview_count {
+            eprintln!("  ... and {} more", total_registries - preview_count);
+        }
+        eprintln!();
+        eprint!("Proceed with downloading {} registries? [Y/n] ", total_registries);
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        let input = input.trim().to_lowercase();
+        if !input.is_empty() && input != "y" && input != "yes" && input != "s" && input != "si" {
+            eprintln!("Download cancelled.");
+            return Ok(());
+        }
     }
 
     // Persist found registries to catalog
@@ -329,7 +400,7 @@ async fn run_batch_download(
         return Ok(());
     }
 
-    let limiter = rate_limiter::create_rate_limiter(effective_rps(args));
+    let limiter = PerHostLimiter::new(effective_rps(args));
 
     let page_range = args
         .pages
@@ -482,7 +553,7 @@ async fn run_noah_mode(
         state_db.upsert_archive(&a.name, &a.slug, Some(&a.url))?;
     }
 
-    let limiter = rate_limiter::create_rate_limiter(effective_rps(args));
+    let limiter = PerHostLimiter::new(effective_rps(args));
 
     let page_range = args
         .pages

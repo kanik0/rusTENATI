@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,7 +13,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::client::antenati::AntenatiClient;
 use crate::client::circuit_breaker::CircuitBreaker;
-use crate::client::rate_limiter::Limiter;
+use crate::client::per_host_limiter::PerHostLimiter;
 use crate::client::waf;
 use crate::download::adaptive::AdaptiveConcurrency;
 use crate::download::progress;
@@ -22,6 +23,24 @@ use crate::output;
 
 const MAX_RETRIES: u32 = 5;
 const INITIAL_BACKOFF_MS: u64 = 1000;
+
+/// Pre-scan a directory to collect all existing non-empty filenames into a HashSet.
+/// This replaces per-file `tokio::fs::metadata` calls with a single readdir sweep.
+async fn scan_existing_files(dir: &Path) -> HashSet<String> {
+    let mut existing = HashSet::new();
+    if let Ok(mut entries) = tokio::fs::read_dir(dir).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            if let Ok(meta) = entry.metadata().await {
+                if meta.is_file() && meta.len() > 0 {
+                    if let Some(name) = entry.file_name().to_str() {
+                        existing.insert(name.to_string());
+                    }
+                }
+            }
+        }
+    }
+    existing
+}
 
 /// Configuration for the download engine.
 pub struct DownloadConfig {
@@ -68,7 +87,7 @@ impl PageRange {
 /// Run the download pipeline for a manifest.
 pub async fn download_manifest(
     client: Arc<AntenatiClient>,
-    rate_limiter: Limiter,
+    rate_limiter: PerHostLimiter,
     state_db: &StateDb,
     manifest: &IiifManifest,
     output_dir: &Path,
@@ -129,12 +148,21 @@ pub async fn download_manifest(
     // Register manifest with full metadata and downloads in state DB
     state_db.store_manifest_from_iiif(manifest, ark_url)?;
 
-    for (i, canvas) in &canvases {
-        let url = canvas.full_image_url(&config.image_format);
-        state_db.insert_download_full(
-            &manifest.id, &canvas.id, *i, &url,
-            Some(&canvas.label), Some(canvas.width), Some(canvas.height),
-        )?;
+    // Bulk INSERT all canvas downloads in a single transaction
+    {
+        let bulk: Vec<_> = canvases.iter().map(|(i, canvas)| {
+            let url = canvas.full_image_url(&config.image_format);
+            crate::download::state::CanvasBulkInsert {
+                manifest_id: manifest.id.clone(),
+                canvas_id: canvas.id.clone(),
+                canvas_index: *i,
+                image_url: url,
+                canvas_label: Some(canvas.label.clone()),
+                width: Some(canvas.width),
+                height: Some(canvas.height),
+            }
+        }).collect();
+        state_db.insert_downloads_bulk(&bulk)?;
     }
 
     // Resume: filter out already completed downloads (single bulk query)
@@ -182,13 +210,34 @@ pub async fn download_manifest(
     let circuit_breaker = Arc::new(CircuitBreaker::new(5, Duration::from_secs(10)));
 
     let mut handles = Vec::with_capacity(remaining);
+    let mut summary = DownloadSummary {
+        total,
+        ..Default::default()
+    };
 
     let images_dir = output_dir.join("images");
+
+    // Pre-scan existing files once instead of per-file metadata checks
+    let existing_files = if config.skip_existing {
+        scan_existing_files(&images_dir).await
+    } else {
+        HashSet::new()
+    };
 
     for (i, canvas) in canvases {
         // Check cancellation before spawning new tasks
         if cancel_token.is_cancelled() {
             break;
+        }
+
+        let filename = output::image_filename(i, &canvas.label, &config.image_format);
+
+        // Skip at loop level using pre-scanned HashSet (avoids per-file syscall)
+        if config.skip_existing && existing_files.contains(&filename) {
+            debug!("Skipping existing file: {}", filename);
+            summary.skipped += 1;
+            main_bar.inc(1);
+            continue;
         }
 
         let permit = semaphore.clone().acquire_owned().await?;
@@ -198,10 +247,8 @@ pub async fn download_manifest(
         let canvas_id = canvas.id.clone();
         let canvas_label = canvas.label.clone();
         let image_url = canvas.full_image_url(&config.image_format);
-        let filename = output::image_filename(i, &canvas.label, &config.image_format);
         let filepath = images_dir.join(&filename);
         let main_bar = main_bar.clone();
-        let skip_existing = config.skip_existing;
         let delay_ms = config.delay_ms;
         let cancel = cancel_token.clone();
         let adaptive = adaptive.clone();
@@ -214,7 +261,6 @@ pub async fn download_manifest(
                 &image_url,
                 &filepath,
                 &canvas_label,
-                skip_existing,
                 delay_ms,
                 &cancel,
                 &cb,
@@ -246,17 +292,6 @@ pub async fn download_manifest(
                         canvas_id,
                         local_path: filepath.to_string_lossy().to_string(),
                         sha256: checksum,
-                        skipped: false,
-                        error: None,
-                    }
-                }
-                Ok(DownloadOutcome::Skipped(checksum)) => {
-                    DownloadResult {
-                        manifest_id,
-                        canvas_id,
-                        local_path: filepath.to_string_lossy().to_string(),
-                        sha256: checksum,
-                        skipped: true,
                         error: None,
                     }
                 }
@@ -266,7 +301,7 @@ pub async fn download_manifest(
                         canvas_id,
                         local_path: String::new(),
                         sha256: String::new(),
-                        skipped: false,
+
                         error: Some("cancelled".to_string()),
                     }
                 }
@@ -277,7 +312,7 @@ pub async fn download_manifest(
                         canvas_id,
                         local_path: String::new(),
                         sha256: String::new(),
-                        skipped: false,
+
                         error: Some(e.to_string()),
                     }
                 }
@@ -289,10 +324,6 @@ pub async fn download_manifest(
 
     // Collect results and flush to DB in batches
     const BATCH_SIZE: usize = 50;
-    let mut summary = DownloadSummary {
-        total,
-        ..Default::default()
-    };
     let mut batch: Vec<DownloadResultBatch> = Vec::with_capacity(BATCH_SIZE);
 
     for handle in handles {
@@ -310,8 +341,6 @@ pub async fn download_manifest(
                 });
                 summary.failed += 1;
             }
-        } else if result.skipped {
-            summary.skipped += 1;
         } else {
             batch.push(DownloadResultBatch {
                 manifest_id: result.manifest_id,
@@ -353,31 +382,19 @@ pub async fn download_manifest(
 
 enum DownloadOutcome {
     Downloaded(String),
-    Skipped(String),
     Cancelled,
 }
 
 async fn download_with_retry(
     client: &AntenatiClient,
-    rate_limiter: &Limiter,
+    rate_limiter: &PerHostLimiter,
     url: &str,
     filepath: &Path,
     label: &str,
-    skip_existing: bool,
     delay_ms: u64,
     cancel: &CancellationToken,
     circuit_breaker: &CircuitBreaker,
 ) -> Result<DownloadOutcome> {
-    // Skip if file already exists and is non-empty
-    if skip_existing && filepath.exists() {
-        if let Ok(meta) = tokio::fs::metadata(filepath).await {
-            if meta.len() > 0 {
-                debug!("Skipping existing file: {} ({} bytes)", filepath.display(), meta.len());
-                return Ok(DownloadOutcome::Skipped(String::new()));
-            }
-        }
-    }
-
     let mut last_error = None;
     let mut backoff_ms = INITIAL_BACKOFF_MS;
 
@@ -398,8 +415,8 @@ async fn download_with_retry(
             }
         }
 
-        // Rate limit
-        rate_limiter.until_ready().await;
+        // Per-host rate limit
+        rate_limiter.until_ready(url).await;
 
         // Optional delay
         if delay_ms > 0 {
@@ -571,7 +588,6 @@ struct DownloadResult {
     canvas_id: String,
     local_path: String,
     sha256: String,
-    skipped: bool,
     error: Option<String>,
 }
 
