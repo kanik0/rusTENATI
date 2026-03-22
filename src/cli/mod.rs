@@ -102,6 +102,18 @@ pub enum Command {
 
     /// Interactive TUI dashboard showing download stats and progress
     Dashboard(commands::dashboard::DashboardArgs),
+
+    /// Ask questions about your genealogical records using AI
+    Ask(commands::ask::AskArgs),
+
+    /// Knowledge graph: build and query family relationships from OCR tags
+    Graph {
+        #[command(subcommand)]
+        action: commands::graph::GraphAction,
+    },
+
+    /// Incremental sync: check manifests for updates since last fetch
+    Sync(commands::sync::SyncArgs),
 }
 
 #[derive(Debug, Subcommand)]

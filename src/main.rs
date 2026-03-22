@@ -41,6 +41,18 @@ async fn main() -> Result<()> {
     let config_path = cli.config.unwrap_or_else(config::Config::default_path);
     let mut config = config::Config::load(&config_path)?;
 
+    // Validate config at startup
+    match config.validate() {
+        Ok(warnings) => {
+            for w in warnings {
+                tracing::warn!("Config: {}", w);
+            }
+        }
+        Err(e) => {
+            anyhow::bail!("Invalid configuration: {e}");
+        }
+    }
+
     // Apply CLI overrides to HTTP config (e.g., --connections)
     if let Command::Download(ref args) = cli.command {
         if let Some(connections) = args.connections {
@@ -109,6 +121,15 @@ async fn main() -> Result<()> {
         }
         Command::Dashboard(args) => {
             cli::commands::dashboard::run(args)?;
+        }
+        Command::Ask(args) => {
+            cli::commands::ask::run(args).await?;
+        }
+        Command::Graph { action } => {
+            cli::commands::graph::run(action, cli.json)?;
+        }
+        Command::Sync(args) => {
+            cli::commands::sync::run(args, cli.json, client, state_db.as_ref().ok()).await?;
         }
     }
 

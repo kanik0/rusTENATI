@@ -36,6 +36,14 @@ pub struct OcrArgs {
     /// Save OCR output alongside images (as .txt / .json)
     #[arg(long, default_value = "true")]
     pub save: bool,
+
+    /// Enhance images before OCR (contrast + denoise)
+    #[arg(long)]
+    pub enhance: bool,
+
+    /// Enable binarization in enhancement (aggressive, may hurt some docs)
+    #[arg(long)]
+    pub binarize: bool,
 }
 
 pub async fn run(args: &OcrArgs, json_output: bool, ocr_config: &OcrConfig) -> Result<()> {
@@ -73,6 +81,23 @@ pub async fn run(args: &OcrArgs, json_output: bool, ocr_config: &OcrConfig) -> R
     let backend = std::sync::Arc::new(backend);
     let mut handles = Vec::new();
 
+    let enhancer = if args.enhance {
+        Some(std::sync::Arc::new(crate::ocr::enhance::ImageEnhancer {
+            contrast: true,
+            denoise: true,
+            binarize: args.binarize,
+        }))
+    } else {
+        None
+    };
+
+    if args.enhance {
+        eprintln!(
+            "Image enhancement enabled (contrast+denoise{})",
+            if args.binarize { "+binarize" } else { "" }
+        );
+    }
+
     for image_path in &images {
         let sem = semaphore.clone();
         let backend = backend.clone();
@@ -81,6 +106,7 @@ pub async fn run(args: &OcrArgs, json_output: bool, ocr_config: &OcrConfig) -> R
         let save = args.save;
         let image_path = image_path.clone();
         let pb = pb.clone();
+        let enhancer = enhancer.clone();
 
         let handle = tokio::spawn(async move {
             let _permit = sem.acquire().await.unwrap();
@@ -91,8 +117,22 @@ pub async fn run(args: &OcrArgs, json_output: bool, ocr_config: &OcrConfig) -> R
                 .to_string();
             pb.set_message(file_name.clone());
 
+            // Enhance image if requested, saving to temp file
+            let (ocr_path, _temp_file) = if let Some(ref enh) = enhancer {
+                let tmp = std::env::temp_dir().join(format!("rustenati_enh_{file_name}"));
+                match enh.enhance(&image_path, &tmp) {
+                    Ok(()) => (tmp.clone(), Some(tmp)),
+                    Err(e) => {
+                        tracing::warn!("Enhancement failed for {file_name}, using original: {e}");
+                        (image_path.clone(), None)
+                    }
+                }
+            } else {
+                (image_path.clone(), None)
+            };
+
             let result = backend
-                .recognize(&image_path, &language, doc_type, extract_tags)
+                .recognize(&ocr_path, &language, doc_type, extract_tags)
                 .await;
 
             match &result {
@@ -102,6 +142,11 @@ pub async fn run(args: &OcrArgs, json_output: bool, ocr_config: &OcrConfig) -> R
                     }
                 }
                 _ => {}
+            }
+
+            // Clean up temp enhanced file
+            if let Some(ref tmp) = _temp_file {
+                let _ = std::fs::remove_file(tmp);
             }
 
             pb.inc(1);

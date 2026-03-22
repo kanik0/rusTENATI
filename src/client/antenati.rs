@@ -183,6 +183,56 @@ impl AntenatiClient {
         iiif::parse_manifest(&json)
     }
 
+    /// Conditionally fetch a manifest, using ETag/Last-Modified for cache validation.
+    /// Returns `Ok(None)` if the manifest has not changed (304 Not Modified).
+    /// Returns `Ok(Some((manifest, etag, last_modified)))` if changed or no cache headers.
+    pub async fn get_manifest_conditional(
+        &self,
+        manifest_url: &str,
+        etag: Option<&str>,
+        last_modified: Option<&str>,
+    ) -> Result<Option<(IiifManifest, Option<String>, Option<String>)>, RustenatiError> {
+        debug!("Conditional fetch: {manifest_url}");
+
+        let mut request = self.http.get(manifest_url);
+        if let Some(etag_val) = etag {
+            request = request.header("If-None-Match", etag_val);
+        }
+        if let Some(lm) = last_modified {
+            request = request.header("If-Modified-Since", lm);
+        }
+
+        let response = request.send().await?;
+
+        if response.status() == reqwest::StatusCode::NOT_MODIFIED {
+            debug!("Manifest not modified: {manifest_url}");
+            return Ok(None);
+        }
+
+        if !response.status().is_success() {
+            // Fall back to regular fetch with retry for errors
+            let manifest = self.get_manifest(manifest_url).await?;
+            return Ok(Some((manifest, None, None)));
+        }
+
+        // Extract cache headers before consuming the response
+        let resp_etag = response
+            .headers()
+            .get("etag")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        let resp_last_modified = response
+            .headers()
+            .get("last-modified")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+
+        let json: serde_json::Value = response.json().await?;
+        let manifest = iiif::parse_manifest(&json)?;
+
+        Ok(Some((manifest, resp_etag, resp_last_modified)))
+    }
+
     /// Fetch the gallery HTML page and extract the manifest URL from it.
     pub async fn find_manifest_url(&self, gallery_url: &str) -> Result<String, RustenatiError> {
         debug!("Fetching gallery page: {gallery_url}");
