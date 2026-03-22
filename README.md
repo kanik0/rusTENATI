@@ -5,10 +5,14 @@ High-performance Rust CLI for downloading genealogical records from [Portale Ant
 ## Features
 
 - **Search** by person name or registry (locality, year, document type) with paginated results
-- **Download** IIIF images with parallel downloads, rate limiting, retry with exponential backoff, and resume support
-- **Batch download** entire search results in a single command
+- **Download** IIIF images with parallel downloads, per-host rate limiting, retry with exponential backoff, and resume support
+- **Batch download** entire search results with preview, confirmation, sampling, and sorting
+- **AI genealogy assistant** — ask natural language questions about your documents (`rustenati ask`)
+- **Knowledge graph** — automatically build family trees from OCR results (`rustenati graph`)
+- **OCR** handwritten historical documents with 4 pluggable backends and image enhancement
+- **GEDCOM export** — export structured data to the universal genealogy standard (GEDCOM 5.5.1)
+- **Incremental sync** — detect changes on the portal since last download (`rustenati sync`)
 - **Web interface** — local web server to browse, filter, and view all downloaded documents
-- **OCR** handwritten historical documents with 4 pluggable backends (Claude Vision, Transkribus, Azure Document Intelligence, Google Cloud Vision)
 - **Tag extraction** — automatically extract surnames, names, dates, locations, roles from OCR results
 - **SQLite state tracking** for download resume, session history, and local tag search
 - **Graceful shutdown** — Ctrl+C saves progress, resume later with `--resume`
@@ -47,6 +51,11 @@ rustenati download <MANIFEST_URL> --resume
 # Batch download: search + download all matching registries
 rustenati download --search --locality Napoli --year-from 1807 --doc-type Nati --max-registries 50
 
+# Batch with preview and confirmation
+rustenati download --search --locality Napoli --doc-type Nati --count    # count only
+rustenati download --search --locality Napoli --doc-type Nati --sample 5  # random sample of 5
+rustenati download --search --locality Napoli --doc-type Nati --sort-by year  # sort by year
+
 # Browse archives
 rustenati browse archives                              # list all ~120 Archivi di Stato
 rustenati browse archives --filter lucca               # filter by name
@@ -68,6 +77,62 @@ rustenati download --noah --resume -j 8 --rps 5       # aggressive download with
 rustenati download --noah --max-archives 10           # limit to first 10 archives
 rustenati download --noah --doc-type Nati --resume    # only birth records, resumable
 ```
+
+## AI Genealogy Assistant
+
+Ask natural language questions about your downloaded and transcribed documents:
+
+```bash
+# Ask about a specific person
+rustenati ask "Chi erano i genitori di Giuseppe Rossi?"
+
+# Ask about witnesses at a wedding
+rustenati ask "Chi erano i testimoni al matrimonio di Maria Bianchi nel 1845?"
+
+# Provide more context documents
+rustenati ask "Quanti figli aveva la famiglia De Luca?" --context 20
+
+# Use a specific model
+rustenati ask "Trova tutti i calzolai menzionati nei documenti" --model claude-sonnet-4-6
+```
+
+Requires `ANTHROPIC_API_KEY` environment variable. The assistant searches your local OCR database (FTS5 full-text search), retrieves relevant documents, and synthesizes answers using Claude API with streaming output.
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--context` | 10 | Number of OCR documents to include as context |
+| `--model` | claude-sonnet-4-6 | Claude model to use |
+| `--api-key` | env `ANTHROPIC_API_KEY` | API key override |
+
+## Knowledge Graph
+
+Build and query a family relationship graph from OCR tag data:
+
+```bash
+# Build the graph from all OCR results
+rustenati graph build
+
+# Search for a person
+rustenati graph query "Rossi"
+
+# Show ancestors of a person (BFS traversal)
+rustenati graph ancestors 42
+
+# Export graph for visualization
+rustenati graph export --format dot     # Graphviz DOT format
+rustenati graph export --format json    # JSON with nodes and edges
+
+# Show graph statistics
+rustenati graph stats
+```
+
+The graph automatically infers relationships from civil records:
+- **Birth records** → parent-child relationships
+- **Marriage records** → spouse relationships
+- **Death records** → spouse relationships
+- **All records** → witness associations
+
+Export to DOT format for visualization with Graphviz: `rustenati graph export --format dot | dot -Tsvg -o family.svg`
 
 ## Performance Tuning
 
@@ -94,6 +159,18 @@ rustenati download --search --archive archivio-di-stato-di-lucca -j 16 --rps 20 
 | `--delay` | 500ms | Per-request delay (politeness) |
 | `--rps` | derived from delay | Explicit rate limit (req/s) |
 | `--connections` | 10 | HTTP pool idle connections per host |
+| `--yes` | off | Skip batch confirmation prompt |
+| `--count` | off | Only count matching registries, don't download |
+| `--sample N` | off | Random sample of N registries |
+| `--sort-by` | none | Sort registries by: year, doc_type, archive |
+
+### Performance Architecture (v0.3.0)
+
+- **Per-host rate limiting** — separate rate budgets for each domain (dam-antenati, iiif-antenati), doubling effective throughput
+- **Bulk filesystem skip** — pre-scans output directory with HashSet, eliminating per-file metadata syscalls
+- **Consolidated SQL queries** — stats queries reduced from 7 to 1, minimizing lock contention
+- **Partial index** on incomplete downloads for 20x faster resume queries
+- **Bulk INSERT** for canvas registration (one transaction instead of hundreds of statements)
 
 ## Document Types (`--doc-type`)
 
@@ -166,9 +243,23 @@ rustenati ocr ./image.jpg --backend claude --doc-type birth
 # OCR an entire directory with tag extraction
 rustenati ocr ./output/images/ --backend claude --extract-tags -j 3
 
+# OCR with image enhancement (improves accuracy on degraded documents)
+rustenati ocr ./output/images/ --backend claude --enhance
+rustenati ocr ./output/images/ --backend claude --enhance --binarize  # aggressive binarization
+
 # Extract tags from existing transcriptions
 rustenati tags extract ./output/ocr/ --backend claude --doc-type birth
 ```
+
+### Image Enhancement (`--enhance`)
+
+Pre-processes images before OCR to improve accuracy on degraded historical documents:
+
+- **Contrast stretching** — histogram normalization to improve faded ink
+- **Median filter** — 3x3 denoising to reduce paper grain and artifacts
+- **Otsu binarization** (`--binarize`) — automatic threshold for converting to black/white (aggressive, use with care)
+
+Enhancement can improve OCR accuracy by 20-40% on documents with poor contrast, faded ink, or noisy backgrounds.
 
 ## Tags
 
@@ -194,6 +285,60 @@ rustenati tags add 42 --tag-type surname --value "DE LUCA"
 # View statistics
 rustenati tags stats
 ```
+
+## Export
+
+Export your data in multiple formats:
+
+```bash
+# Export to CSV
+rustenati export --type csv
+
+# Export to JSON
+rustenati export --type json
+
+# Export to GEDCOM 5.5.1 (universal genealogy format)
+rustenati export --type gedcom
+rustenati export --type gedcom --output family.ged
+```
+
+### GEDCOM Export
+
+Exports all structured person data to [GEDCOM 5.5.1](https://www.familysearch.org/developers/docs/gedcom/), the universal standard supported by all genealogy software (FamilySearch, Ancestry, MyHeritage, Gramps, etc.).
+
+The export includes:
+- **INDI records** for each person with NAME, BIRT, DEAT events
+- **SOUR citations** with ARK URL links back to the original documents on Portale Antenati
+- **REPO record** for the Portale Antenati archive
+
+## Incremental Sync
+
+Detect changes on the portal since your last download:
+
+```bash
+# Check all manifests for updates
+rustenati sync
+
+# Check only manifests not updated in 30+ days
+rustenati sync --older-than-days 30
+
+# Limit to 50 manifests per run
+rustenati sync --limit 50
+
+# Dry run: report changes without updating the database
+rustenati sync --dry-run
+
+# JSON output
+rustenati sync --json
+```
+
+Uses HTTP conditional requests (`If-None-Match`, `If-Modified-Since`) to efficiently detect changes without re-downloading manifests that haven't changed.
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--limit` | 100 | Max manifests to check per run |
+| `--older-than-days` | all | Only check manifests older than N days |
+| `--dry-run` | off | Report changes without updating |
 
 ## Status & Sessions
 
@@ -297,6 +442,8 @@ rustenati config set ocr.default_backend claude
 
 Config file: `~/.config/rustenati/config.toml` (see [config.example.toml](config.example.toml))
 
+Configuration is validated at startup. Invalid values produce clear error messages, and non-fatal issues generate warnings (e.g., very high concurrency values).
+
 ## Source Formats
 
 The `download` and `info` commands accept multiple source formats:
@@ -354,6 +501,30 @@ The web interface provides:
 - **Image viewer** with zoom/pan and keyboard navigation
 - **Person search** with linked records
 - **Full-text OCR search** across all transcriptions
+
+## Command Reference
+
+| Command | Description |
+|---------|-------------|
+| `search name` | Search by person name |
+| `search registry` | Search by registry (locality, year, type) |
+| `browse archives` | List/filter Archivi di Stato |
+| `download` | Download images (single, batch, or Noah mode) |
+| `info` | Inspect manifest metadata |
+| `ocr` | Run OCR on images (with optional `--enhance`) |
+| `tags` | Manage extracted tags (search, list, add, stats) |
+| `ask` | AI genealogy assistant (natural language queries) |
+| `graph` | Knowledge graph (build, query, ancestors, export, stats) |
+| `export` | Export to CSV, JSON, or GEDCOM |
+| `sync` | Incremental sync (detect portal changes) |
+| `status` | Show download status and sessions |
+| `verify` | Integrity verification (SHA256) |
+| `thumbnail` | Generate image thumbnails |
+| `link` | Cross-record person linking |
+| `query` | Offline database queries (FTS5 search) |
+| `dashboard` | Interactive TUI monitoring |
+| `serve` | Local web server |
+| `config` | Configuration management |
 
 ## Documentation
 
